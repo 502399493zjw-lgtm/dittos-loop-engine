@@ -64,6 +64,12 @@ export function createServer(cfg: ServerConfig) {
     const url = req.url ?? ''
     const method = req.method ?? 'GET'
 
+    // ---- CORS: permissive so a browser frontend on another origin can call the API ----
+    res.setHeader('access-control-allow-origin', '*')
+    res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS')
+    res.setHeader('access-control-allow-headers', 'content-type')
+    if (method === 'OPTIONS') { res.writeHead(204).end(); return } // preflight
+
     // ---- P1: ad-hoc run ----
     if (method === 'POST' && url === '/runs') {
       void readBody(req).then((body) => {

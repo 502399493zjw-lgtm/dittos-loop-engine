@@ -130,3 +130,31 @@ describe('server — loop endpoints', () => {
     await srv.close()
   })
 })
+
+describe('server — CORS', () => {
+  it('OPTIONS /loops short-circuits as a 204 preflight with permissive CORS headers', async () => {
+    const { srv } = loopServer({ demo: async () => 'ok' })
+    const { port } = await srv.listen(0)
+
+    const res = await fetch(`http://localhost:${port}/loops`, { method: 'OPTIONS' })
+    expect(res.status).toBe(204)
+    expect(res.headers.get('access-control-allow-origin')).toBe('*')
+    expect(res.headers.get('access-control-allow-methods')).toContain('GET')
+    expect(res.headers.get('access-control-allow-methods')).toContain('POST')
+    expect(res.headers.get('access-control-allow-methods')).toContain('OPTIONS')
+    expect(res.headers.get('access-control-allow-headers')).toContain('content-type')
+
+    await srv.close()
+  })
+
+  it('GET /loops carries access-control-allow-origin so a cross-origin browser can read it', async () => {
+    const { srv } = loopServer({ demo: async () => 'ok' })
+    const { port } = await srv.listen(0)
+
+    const res = await fetch(`http://localhost:${port}/loops`)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('access-control-allow-origin')).toBe('*')
+
+    await srv.close()
+  })
+})
