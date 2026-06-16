@@ -40,12 +40,22 @@ export type EngineEvent =
   | { type: 'budget_exceeded'; runId: string; spent: number; cap: number; ts: number }
   | { type: 'run_done'; runId: string; status: RunStatus; summary?: string; result?: unknown; ts: number }
 
+/** A per-loop ratcheting memory surface (read full text / append a line). */
+export interface Memory {
+  read(): string
+  append(line: string): void
+}
+
 export interface FlowApi {
   agent(prompt: string, opts?: AgentOpts): Promise<string | Record<string, unknown>>
   parallel<T>(thunks: Array<() => Promise<T>>): Promise<Array<T | null>>
   pipeline(items: unknown[], ...stages: Array<(prev: unknown, item: unknown, i: number) => Promise<unknown>>): Promise<unknown[]>
   phase(title: string): void
   log(message: string): void
+  /** Record the new cursor; only persisted if the run completes. */
+  commit(patch: { cursor?: unknown }): void
+  /** Per-loop memory.md surface; falls back to an in-process noop when no memory is injected. */
+  memory: Memory
   args: unknown
 }
 export type Flow = (api: FlowApi) => Promise<unknown>
@@ -57,6 +67,8 @@ export interface RunDeps {
   args?: unknown
   /** per-run cost cap in USD; undefined = no cap */
   budgetUsd?: number
+  /** per-loop memory surface; when absent the run gets an in-process noop */
+  memory?: Memory
   emit: (e: EngineEvent) => void
   /** injectable for deterministic tests */
   now?: () => number

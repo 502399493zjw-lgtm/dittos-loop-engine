@@ -1,5 +1,11 @@
-import type { EngineEvent, FlowApi, Flow, RunDeps, RunStatus, AgentOpts } from '../types'
+import type { EngineEvent, FlowApi, Flow, RunDeps, RunStatus, AgentOpts, Memory } from '../types'
 import { makeIdGen, wallClock } from './ids'
+
+/** In-process memory used when a run has no injected (file-backed) memory. */
+function noopMemory(): Memory {
+  const lines: string[] = []
+  return { read: () => lines.join('\n'), append: (l: string) => { lines.push(l) } }
+}
 
 /** Thrown when cumulative run cost reaches the per-run budget cap; turned into a `failed` run by runFlow's catch. */
 export class BudgetExceeded extends Error {
@@ -9,12 +15,14 @@ export class BudgetExceeded extends Error {
   }
 }
 
-export async function runFlow(flow: Flow, deps: RunDeps): Promise<{ status: RunStatus; result?: unknown }> {
+export async function runFlow(flow: Flow, deps: RunDeps): Promise<{ status: RunStatus; result?: unknown; cursor?: unknown }> {
   const now = deps.now ?? wallClock
   const nextId = deps.nextId ?? makeIdGen()
   const { runId, executor, defaultAgent, emit } = deps
   let activePhase: string | null = null
   let spent = 0
+  // The committed cursor is staged here; only flushed into the return value if the run completes.
+  let committed: { cursor?: unknown } = {}
 
   emit({ type: 'run_started', runId, args: deps.args, ts: now() })
 
@@ -57,6 +65,8 @@ export async function runFlow(flow: Flow, deps: RunDeps): Promise<{ status: RunS
       emit({ type: 'phase_started', runId, phaseId: activePhase, title, ts: now() })
     },
     log(message: string) { emit({ type: 'log', runId, message, ts: now() }) },
+    commit(patch: { cursor?: unknown }) { committed = { ...committed, ...patch } },
+    memory: deps.memory ?? noopMemory(),
     // parallel/pipeline are attached by Tasks 5/6 (bindParallel/bindPipeline) to avoid a circular import.
     parallel: async () => { throw new Error('parallel not bound') },
     pipeline: async () => { throw new Error('pipeline not bound') },
@@ -70,7 +80,8 @@ export async function runFlow(flow: Flow, deps: RunDeps): Promise<{ status: RunS
     const result = await flow(api)
     const summary = typeof result === 'string' ? result : undefined
     emit({ type: 'run_done', runId, status: 'completed', summary, result, ts: now() })
-    return { status: 'completed', result }
+    // Only surface the cursor if the flow actually committed one (keeps the no-commit return shape unchanged).
+    return { status: 'completed', result, ...('cursor' in committed ? { cursor: committed.cursor } : {}) }
   } catch (err) {
     emit({ type: 'run_done', runId, status: 'failed', ts: now() })
     return { status: 'failed' }
