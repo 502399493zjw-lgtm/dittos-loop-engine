@@ -330,6 +330,10 @@ export function createServer(cfg: ServerConfig) {
         }
         const userMessage = await cfg.sessionStore!.appendMessage(channelId, {
           sender_type: 'user',
+          // Stamp the authed user's id so the frontend recognises it as "own"
+          // (right-aligned bubble). Without this, sender_id defaults to the
+          // sender_type string and never matches the logged-in user's id.
+          ...(userId !== undefined ? { sender_id: userId } : {}),
           type: type ?? 'text',
           content: { text: content?.text ?? '' },
           ...(reply_to !== undefined ? { reply_to } : {}),
