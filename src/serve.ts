@@ -19,6 +19,9 @@ import { jsonLoopStore } from './loop/jsonLoopStore'
 import { loopRunner } from './loop/loopRunner'
 import { jsonSessionStore } from './session/jsonSessionStore'
 import { storeSessionBus } from './session/storeSessionBus'
+import { jsonTurnStore } from './chat/turnStore'
+import { jsonTraceStore } from './chat/traceStore'
+import { claudeStreamExecutor } from './chat/streamExecutor'
 import { githubOAuth } from './auth/github'
 import { jsonUserStore } from './auth/jsonUserStore'
 import { jsonTokenStore } from './auth/jsonTokenStore'
@@ -82,6 +85,12 @@ async function main(): Promise<void> {
   // project-scoped session; the /sessions endpoints read/write the same store.
   const sessionStore = jsonSessionStore(process.env.SESSION_DATA_DIR || './.data/sessions')
   const sessionBus = storeSessionBus(sessionStore)
+  // Chat slice: turn + trace stores (JSON under ./.data) + the real `claude -p
+  // stream-json` executor. Together with sessionStore they enable /channels +
+  // /turns and the per-channel WS (spec §1-§3).
+  const turnStore = jsonTurnStore(process.env.TURN_DATA_DIR || './.data/turns')
+  const traceStore = jsonTraceStore(process.env.TRACE_DATA_DIR || './.data/trace')
+  const streamExecutor = claudeStreamExecutor()
   const auth = buildAuthConfig()
 
   const srv = createServer({
@@ -91,6 +100,9 @@ async function main(): Promise<void> {
     store,
     sessionStore,
     sessionBus,
+    turnStore,
+    traceStore,
+    streamExecutor,
     ...(auth ? { auth } : {}),
     makeRunner: (emit, awaitApproval, sessionBus) => loopRunner({ store, executor, flows, emit, awaitApproval, sessionBus, notify: () => {}, defaultAgent: 'claude', memoryDir }),
   })
@@ -108,7 +120,13 @@ async function main(): Promise<void> {
   console.log(`  GET  ${base}/sessions`)
   console.log(`  POST ${base}/sessions/:id/messages`)
   console.log(`  GET  ${base}/sessions/:id/messages`)
+  console.log(`  POST ${base}/channels/:id/messages`)
+  console.log(`  GET  ${base}/channels/:id/messages`)
+  console.log(`  GET  ${base}/channels/:id/turns`)
+  console.log(`  GET  ${base}/turns/:id`)
+  console.log(`  GET  ${base}/turns/:id/events`)
   console.log(`  WS   ${base.replace('http', 'ws')}/runs/:id/events`)
+  console.log(`  WS   ${base.replace('http', 'ws')}/channels/:id/events`)
 }
 
 // Only boot when run as the process entrypoint, so importing for tests is side-effect free.

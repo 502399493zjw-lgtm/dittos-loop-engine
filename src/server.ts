@@ -8,6 +8,9 @@ import type { LoopSpec, LoopStore } from './loop/types'
 import type { LoopRunner } from './loop/loopRunner'
 import type { SessionBus } from './loop/sessionBus'
 import type { SessionStore } from './session/types'
+import type { TurnStore, TraceStore } from './chat/types'
+import type { StreamExecutor } from './chat/streamExecutor'
+import { respondToMessage } from './chat/respond'
 import type { GithubOAuth } from './auth/github'
 import type { UserStore, TokenStore } from './auth/types'
 import { signState, verifyState } from './auth/state'
@@ -21,6 +24,16 @@ export interface ServerConfig {
   store?: LoopStore
   /** Session/chat persistence; required for the /sessions endpoints. */
   sessionStore?: SessionStore
+  /**
+   * Chat slice (standalone-chat wire contract, spec §1-§3). The /channels +
+   * /turns endpoints and the per-channel WS are enabled when turnStore +
+   * traceStore + streamExecutor are all set (alongside sessionStore). When any
+   * is unset the chat surface is absent (those routes 500) — the /sessions
+   * surface and everything else are unaffected.
+   */
+  turnStore?: TurnStore
+  traceStore?: TraceStore
+  streamExecutor?: StreamExecutor
   /**
    * When set, each loop run opens a fresh chat session under its project and
    * auto-mirrors its narration into it; forwarded into the runner via makeRunner.
@@ -60,6 +73,35 @@ export function createServer(cfg: ServerConfig) {
   // live subscribers + buffered events per run (P1: in-memory; store is the durable copy)
   const subs = new Map<string, Set<(e: EngineEvent) => void>>()
   const buffer = new Map<string, EngineEvent[]>()
+
+  // Chat is enabled when the session + turn + trace stores and a stream executor
+  // are all wired. The /channels + /turns REST and the per-channel WS gate on this.
+  const chatEnabled = !!(cfg.sessionStore && cfg.turnStore && cfg.traceStore && cfg.streamExecutor)
+
+  // Per-channel WS subscribers for the chat wire envelopes (new_message /
+  // turn:created / turn:update / trace:* / msg:chunk). A subscriber records
+  // whether it opted into trace (subscribe_trace) so trace:* only goes to
+  // those who asked; all other envelopes go to every channel subscriber.
+  type ChatSink = { send: (type: string, payload: unknown) => void; trace: boolean }
+  const chatSubs = new Map<string, Set<ChatSink>>()
+  // trace:* only goes to subscribers who opted into subscribe_trace.
+  const TRACE_TYPES = new Set(['trace:batch', 'trace:event'])
+  // The "trace v2" envelope family the frontend dispatches as a NESTED
+  // { type, payload } (turn:* / trace:* / msg:chunk). new_message stays FLAT.
+  const V2_ENVELOPE_TYPES = new Set([
+    'turn:created', 'turn:update', 'trace:event', 'trace:batch', 'msg:chunk',
+  ])
+
+  // The emit sink handed to respondToMessage for one channel: fan the envelope
+  // out to that channel's live WS subscribers (trace gated by subscribe_trace).
+  function emitForChannel(channelId: string) {
+    return (type: string, payload: unknown) => {
+      for (const sink of chatSubs.get(channelId) ?? []) {
+        if (TRACE_TYPES.has(type) && !sink.trace) continue
+        sink.send(type, payload)
+      }
+    }
+  }
 
   function emitFor(runId: string) {
     return (e: EngineEvent) => {
@@ -103,11 +145,14 @@ export function createServer(cfg: ServerConfig) {
     return userId
   }
 
-  // Paths gated by bearer auth (only when cfg.auth is set): /loops + /sessions and
-  // their sub-routes. /auth/* and everything else stay public.
+  // Paths gated by bearer auth (only when cfg.auth is set): /loops + /sessions +
+  // the chat surface (/channels + /turns) and their sub-routes. /auth/* and
+  // everything else stay public.
   const isGatedPath = (path: string) =>
     path === '/loops' || path.startsWith('/loops/') ||
-    path === '/sessions' || path.startsWith('/sessions/')
+    path === '/sessions' || path.startsWith('/sessions/') ||
+    path === '/channels' || path.startsWith('/channels/') ||
+    path === '/turns' || path.startsWith('/turns/')
 
   const httpServer = http.createServer((req, res) => {
     const url = req.url ?? ''
@@ -200,6 +245,102 @@ export function createServer(cfg: ServerConfig) {
       if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
       void cfg.sessionStore.getMessages(sessionId).then((messages) => {
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(messages))
+      })
+      return
+    }
+
+    // ---- C4: chat (standalone-chat wire contract §1-§3) ----
+    // A channel === a session (channel_id === sessionId).
+
+    // POST /channels/:id/messages: persist the user Message (200) THEN fire
+    // respondToMessage fire-and-forget (trace + reply stream over the channel WS).
+    const chMessages = /^\/channels\/([^/]+)\/messages$/.exec(url.split('?')[0]!)
+    if (method === 'POST' && chMessages) {
+      const channelId = chMessages[1]!
+      if (!chatEnabled) { res.writeHead(500).end('chat not configured'); return }
+      void readBody(req).then(async (body) => {
+        const { type, content, reply_to } = JSON.parse(body || '{}') as {
+          type?: string; content?: { text?: string }; reply_to?: string
+        }
+        const userMessage = await cfg.sessionStore!.appendMessage(channelId, {
+          sender_type: 'user',
+          type: type ?? 'text',
+          content: { text: content?.text ?? '' },
+          ...(reply_to !== undefined ? { reply_to } : {}),
+        })
+        // Mirror the user message to channel subscribers so other tabs see it too.
+        emitForChannel(channelId)('new_message', { channel_id: channelId, message: userMessage })
+        // Return the persisted user message immediately; the agent turn streams over WS.
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(userMessage))
+        // Fire-and-forget the agent turn; failures surface as turn:update(failed) over WS.
+        void respondToMessage(
+          {
+            sessionStore: cfg.sessionStore!,
+            turnStore: cfg.turnStore!,
+            traceStore: cfg.traceStore!,
+            streamExecutor: cfg.streamExecutor!,
+            emit: emitForChannel(channelId),
+          },
+          { channelId, ...(userId !== undefined ? { ownerId: userId } : {}), userMessage },
+        ).catch(() => {})
+      })
+      return
+    }
+
+    // GET /channels/:id/messages?before_seq&limit → Message[] (paginates by seq).
+    if (method === 'GET' && chMessages) {
+      const channelId = chMessages[1]!
+      if (!chatEnabled) { res.writeHead(500).end('chat not configured'); return }
+      const params = new URL(url, 'http://x').searchParams
+      const beforeSeq = params.get('before_seq')
+      const limitRaw = params.get('limit')
+      const before = beforeSeq !== null ? Number(beforeSeq) : undefined
+      const limit = limitRaw !== null ? Number(limitRaw) : undefined
+      void cfg.sessionStore!.getMessages(channelId).then((all) => {
+        // Chronological (ascending seq). Window = messages with seq < before_seq,
+        // then take the most-recent `limit` of that window (still ascending).
+        let rows = before !== undefined ? all.filter((m) => m.seq < before) : all
+        if (limit !== undefined && rows.length > limit) rows = rows.slice(rows.length - limit)
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(rows))
+      })
+      return
+    }
+
+    // GET /channels/:id/turns?limit → Turn[] (batch-hydrate trace handles on open).
+    const chTurns = /^\/channels\/([^/]+)\/turns$/.exec(url.split('?')[0]!)
+    if (method === 'GET' && chTurns) {
+      const channelId = chTurns[1]!
+      if (!chatEnabled) { res.writeHead(500).end('chat not configured'); return }
+      const limitRaw = new URL(url, 'http://x').searchParams.get('limit')
+      const limit = limitRaw !== null ? Number(limitRaw) : undefined
+      void cfg.turnStore!.listByChannel(channelId, userId !== undefined ? { ownerId: userId } : undefined).then((turns) => {
+        const rows = limit !== undefined && turns.length > limit ? turns.slice(turns.length - limit) : turns
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(rows))
+      })
+      return
+    }
+
+    // GET /turns/:id/events?after_seq → { turn_id, events: TraceEvent[] }.
+    const turnEvents = /^\/turns\/([^/]+)\/events$/.exec(url.split('?')[0]!)
+    if (method === 'GET' && turnEvents) {
+      const turnId = turnEvents[1]!
+      if (!chatEnabled) { res.writeHead(500).end('chat not configured'); return }
+      const afterRaw = new URL(url, 'http://x').searchParams.get('after_seq')
+      const afterSeq = afterRaw !== null ? Number(afterRaw) : undefined
+      void cfg.traceStore!.list(turnId, afterSeq).then((events) => {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ turn_id: turnId, events }))
+      })
+      return
+    }
+
+    // GET /turns/:id → Turn (metadata).
+    const turnGet = /^\/turns\/([^/]+)$/.exec(url.split('?')[0]!)
+    if (method === 'GET' && turnGet) {
+      const turnId = turnGet[1]!
+      if (!chatEnabled) { res.writeHead(500).end('chat not configured'); return }
+      void cfg.turnStore!.get(turnId).then((turn) => {
+        if (!turn) { res.writeHead(404).end('unknown turn'); return }
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(turn))
       })
       return
     }
@@ -308,7 +449,36 @@ export function createServer(cfg: ServerConfig) {
 
   const wss = new WebSocketServer({ server: httpServer })
   wss.on('connection', (ws, req) => {
-    const m = /\/runs\/([^/]+)\/events/.exec(req.url ?? '')
+    const reqUrl = req.url ?? ''
+
+    // Chat: subscribe to a channel's live envelopes. `?trace=1` (subscribe_trace)
+    // opts the connection into the trace:* stream too. Envelope wire shape is set
+    // per-type by the sink below (nested for the v2 family, flat for new_message).
+    const ch = /^\/channels\/([^/]+)\/events/.exec(reqUrl)
+    if (ch) {
+      const channelId = ch[1]
+      if (!channelId) { ws.close(); return }
+      const trace = new URL(reqUrl, 'http://x').searchParams.get('trace') === '1'
+      // Wire shape per the frontend's useWebSocket dispatcher: the trace v2
+      // family (turn:created/turn:update/trace:event/trace:batch/msg:chunk) is a
+      // NESTED envelope `{ type, payload }` (handleTraceEnvelope reads data.payload),
+      // while new_message is FLAT `{ type, channel_id, message }` (it reads the
+      // fields at top level). Nest the v2 family; spread everything else flat.
+      const sink = {
+        send: (type: string, payload: unknown) =>
+          ws.send(JSON.stringify(
+            V2_ENVELOPE_TYPES.has(type)
+              ? { type, payload }
+              : { type, ...(payload as Record<string, unknown>) },
+          )),
+        trace,
+      }
+      ;(chatSubs.get(channelId) ?? chatSubs.set(channelId, new Set()).get(channelId)!).add(sink)
+      ws.on('close', () => chatSubs.get(channelId)?.delete(sink))
+      return
+    }
+
+    const m = /\/runs\/([^/]+)\/events/.exec(reqUrl)
     if (!m) { ws.close(); return }
     const runId = m[1]
     if (!runId) { ws.close(); return }

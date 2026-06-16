@@ -13,7 +13,7 @@ export function storeSessionBus(store: SessionStore): SessionBus {
       return { sessionId: session.id }
     },
     async postMessage(sessionId, text) {
-      await store.appendMessage(sessionId, { sender: 'agent', text })
+      await store.appendMessage(sessionId, { sender_type: 'agent', type: 'text', content: { text } })
     },
   }
 }

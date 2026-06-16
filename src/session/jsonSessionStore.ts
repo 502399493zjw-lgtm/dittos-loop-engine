@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { Message, Session, SessionStore } from './types'
+import type { AppendMessageInput, Message, SenderType, Session, SessionStore } from './types'
 
 /**
  * jsonSessionStore — JSON-backed, in-process session/chat persistence.
@@ -44,9 +44,40 @@ export function jsonSessionStore(dir: string, opts?: { now?: () => number }): Se
         (opts?.ownerId === undefined || s.ownerId === opts.ownerId),
       )
     },
-    async appendMessage(sessionId, msg) {
-      const message: Message = { id: randomUUID(), sessionId, sender: msg.sender, text: msg.text, ts: now() }
+    async appendMessage(sessionId, msg: AppendMessageInput) {
+      // Normalise the legacy ({ sender, text }) and contract ({ sender_type, content })
+      // shapes into one, then mirror both onto the stored Message.
+      const senderType: SenderType = 'sender_type' in msg ? msg.sender_type : msg.sender
+      const text = 'content' in msg ? msg.content.text : msg.text
+      // The legacy `sender` field only models agent|user; map system→agent for it.
+      const legacySender: 'agent' | 'user' = senderType === 'user' ? 'user' : 'agent'
+
       const messages = readAll<Message>(messagesFile)
+      // Dense per-channel seq: continue from the persisted max for this channel.
+      const channelSeqs = messages.filter((m) => m.channel_id === sessionId).map((m) => m.seq)
+      const seq = channelSeqs.length === 0 ? 0 : Math.max(...channelSeqs) + 1
+      const ts = now()
+
+      const message: Message = {
+        // Caller may supply the id (e.g. a streaming bubble id) so chunks and
+        // the persisted message share one message_id; otherwise mint one.
+        id: msg.id ?? randomUUID(),
+        channel_id: sessionId,
+        sender_id: msg.sender_id ?? senderType,
+        sender_type: senderType,
+        type: msg.type ?? 'text',
+        content: { text },
+        seq,
+        ...(msg.turn_id !== undefined ? { turn_id: msg.turn_id } : {}),
+        ...(msg.reply_to !== undefined ? { reply_to: msg.reply_to } : {}),
+        created_at: ts,
+        ...(msg.streaming !== undefined ? { streaming: msg.streaming } : {}),
+        // legacy mirror
+        sessionId,
+        sender: legacySender,
+        text,
+        ts,
+      }
       messages.push(message)
       writeAll(messagesFile, messages)
       return message
