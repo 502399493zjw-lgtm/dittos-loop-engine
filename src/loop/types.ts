@@ -1,7 +1,9 @@
 export interface LoopSpec {
   id: string
   flow: string                 // key into the server's flows registry
-  trigger: { kind: 'interval'; everyMs: number }  // P2: interval only; cron later
+  trigger:
+    | { kind: 'interval'; everyMs: number }
+    | { kind: 'cron'; expr: string }
   budgetUsd?: number           // per-run cost cap; undefined = no cap
   maxConsecutiveFailures?: number  // default 3
 }

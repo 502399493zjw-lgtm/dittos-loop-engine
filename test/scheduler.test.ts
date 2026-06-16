@@ -102,6 +102,50 @@ describe('loopScheduler — interval ticking', () => {
     expect(runner.calls.length).toBe(after1s)
   })
 
+  it('fires a cron loop in its matching minute, once, and not in a non-matching minute', async () => {
+    const store = freshStore()
+    // 09:00 every day; lastRunAt starts null
+    await store.upsert(spec({ id: 'CRON', trigger: { kind: 'cron', expr: '0 9 * * *' } }))
+    // runner-spy that, like the real loopRunner, stamps lastRunAt on each tick —
+    // this is what the once-per-minute de-dup hangs off of
+    const calls: string[] = []
+    // clock pinned to 09:00 local time
+    const nineAm = new Date(2026, 5, 16, 9, 0, 0, 0).getTime()
+    let clock = nineAm
+    const runner: LoopRunner = {
+      async tick(loopId: string) {
+        calls.push(loopId)
+        await store.setState(loopId, { lastRunAt: clock })
+      },
+    }
+    const sched = loopScheduler({ store, runner, tickMs: 100, now: () => clock })
+
+    sched.start()
+    // sweep within the 09:00 minute → fires once
+    await vi.advanceTimersByTimeAsync(100)
+    // advance the wall clock but stay inside 09:00 → no second fire
+    clock = nineAm + 30000
+    await vi.advanceTimersByTimeAsync(100)
+    sched.stop()
+
+    expect(calls.filter((id) => id === 'CRON')).toHaveLength(1)
+  })
+
+  it('does not fire a cron loop in a non-matching minute', async () => {
+    const store = freshStore()
+    await store.upsert(spec({ id: 'CRON', trigger: { kind: 'cron', expr: '0 9 * * *' } }))
+    const runner = fakeRunner()
+    // clock pinned to 10:00 — 09:00 cron must not fire
+    let clock = new Date(2026, 5, 16, 10, 0, 0, 0).getTime()
+    const sched = loopScheduler({ store, runner, tickMs: 100, now: () => clock })
+
+    sched.start()
+    await vi.advanceTimersByTimeAsync(100)
+    sched.stop()
+
+    expect(runner.calls.filter((id) => id === 'CRON')).toHaveLength(0)
+  })
+
   it('one loop throwing does not stop the scheduler from ticking others', async () => {
     const store = freshStore()
     await store.upsert(spec({ id: 'BAD' }))

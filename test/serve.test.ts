@@ -32,7 +32,7 @@ describe('serve — demo wiring', () => {
     await seedDemoLoop(store)
     const got = await store.get('demo-loop')
     // untouched: original trigger + state preserved
-    expect(got?.spec.trigger.everyMs).toBe(1234)
+    expect(got?.spec.trigger).toEqual({ kind: 'interval', everyMs: 1234 })
     expect(got?.state.paused).toBe(true)
     expect(got?.state.consecutiveFailures).toBe(2)
   })
