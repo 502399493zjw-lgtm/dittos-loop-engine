@@ -1,6 +1,6 @@
 import http from 'node:http'
 import { WebSocketServer } from 'ws'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash, timingSafeEqual } from 'node:crypto'
 import { runFlow } from './engine/runtime'
 import { jsonStore } from './store/jsonStore'
 import type { EngineEvent, Executor, Flow, ApprovalRequest, ApprovalResult } from './types'
@@ -12,6 +12,8 @@ import type { ProjectStore } from './project/types'
 import type { TurnStore, TraceStore } from './chat/types'
 import type { StreamExecutor } from './chat/streamExecutor'
 import { respondToMessage } from './chat/respond'
+import type { DaemonHub, DaemonConn } from './daemon/daemonHub'
+import { parseDaemonMessage } from './daemon/protocol'
 import type { GithubOAuth } from './auth/github'
 import type { UserStore, TokenStore } from './auth/types'
 import { signState, verifyState } from './auth/state'
@@ -51,6 +53,20 @@ export interface ServerConfig {
    */
   makeRunner?: (emit: (e: EngineEvent) => void, awaitApproval: (req: ApprovalRequest) => Promise<ApprovalResult>, sessionBus?: SessionBus) => LoopRunner
   /**
+   * Daemon link (spec §2-§3). When set, the `/daemon/ws` endpoint is mounted: a
+   * local daemon connects with `?token=<t>`, the engine hashes it and compares
+   * (timing-safe) against `tokenHash`, closing on mismatch. The accepted conn is
+   * registered into `hub`; inbound daemon messages (turn:start/trace:batch/turn:end)
+   * are routed to the hub. `daemonExecutor(hub)` (wired as the chat streamExecutor
+   * and/or loop executor in serve.ts) dispatches turns over this same hub. When
+   * unset, no daemon surface exists (local-dev path with the in-process executors).
+   */
+  daemon?: {
+    hub: DaemonHub
+    /** sha256 hex of the shared DAEMON_TOKEN; the connecting token is hashed the same way. */
+    tokenHash: string
+  }
+  /**
    * GitHub-OAuth bearer auth. When set, the /auth/* endpoints are mounted and
    * tokens are minted on callback. When unset (dev), no auth surface exists.
    */
@@ -69,6 +85,21 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     req.on('data', (c) => (body += c))
     req.on('end', () => resolve(body))
   })
+}
+
+/**
+ * Timing-safe compare of a connecting daemon token against the configured hash.
+ * The engine stores sha256(DAEMON_TOKEN) as hex; the daemon connects with the
+ * raw token, which we hash the same way and compare via timingSafeEqual over the
+ * fixed-length hex digests (so an empty/short token never short-circuits).
+ */
+function tokenMatches(token: string, expectedHash: string): boolean {
+  if (!token || !expectedHash) return false
+  const got = createHash('sha256').update(token).digest('hex')
+  const a = Buffer.from(got)
+  const b = Buffer.from(expectedHash)
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
 }
 
 export function createServer(cfg: ServerConfig) {
@@ -492,9 +523,39 @@ export function createServer(cfg: ServerConfig) {
     }
   })
 
-  const wss = new WebSocketServer({ server: httpServer })
+  // Daemon link auth (spec §2) is enforced at the WS HANDSHAKE: a `/daemon/ws`
+  // upgrade is rejected (HTTP 401, never upgraded) unless the daemon surface is
+  // configured AND the `?token` hashes to the configured tokenHash (timing-safe).
+  // All non-daemon WS paths pass through untouched (chat + run streams). Rejecting
+  // pre-upgrade means a bad daemon never observes an open socket.
+  const isDaemonPath = (u: string) => /^\/daemon\/ws(\?|$)/.test(u)
+  const wss = new WebSocketServer({
+    server: httpServer,
+    verifyClient: (info: { req: http.IncomingMessage }) => {
+      const u = info.req.url ?? ''
+      if (!isDaemonPath(u)) return true // chat/run WS: handled in 'connection'
+      if (!cfg.daemon) return false
+      const token = new URL(u, 'http://x').searchParams.get('token') ?? ''
+      return tokenMatches(token, cfg.daemon.tokenHash)
+    },
+  })
   wss.on('connection', (ws, req) => {
     const reqUrl = req.url ?? ''
+
+    // Daemon link (spec §2-§3): token was already verified at handshake. Adapt the
+    // WS to a DaemonConn, register it into the hub, and route inbound daemon→engine
+    // messages (turn:start/trace:batch/turn:end) to the hub. Drop on close.
+    if (isDaemonPath(reqUrl) && cfg.daemon) {
+      const hub = cfg.daemon.hub
+      const conn: DaemonConn = { send: (msg) => ws.send(JSON.stringify(msg)) }
+      hub.register(conn)
+      ws.on('message', (data) => {
+        const msg = parseDaemonMessage(data as Buffer)
+        if (msg) hub.handleMessage(msg)
+      })
+      ws.on('close', () => hub.unregister(conn))
+      return
+    }
 
     // Chat: subscribe to a channel's live envelopes. `?trace=1` (subscribe_trace)
     // opts the connection into the trace:* stream too. Envelope wire shape is set

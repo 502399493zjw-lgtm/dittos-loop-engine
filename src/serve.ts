@@ -12,9 +12,12 @@
  * fire when this module is the process entrypoint.
  */
 import { fileURLToPath } from 'node:url'
+import { createHash } from 'node:crypto'
 import { createServer } from './server'
 import { claudeCliExecutor } from './executor/claudeCli'
 import { fakeExecutor } from './executor/fake'
+import { daemonHub } from './daemon/daemonHub'
+import { daemonExecutor } from './daemon/daemonExecutor'
 import { jsonLoopStore } from './loop/jsonLoopStore'
 import { loopRunner } from './loop/loopRunner'
 import { jsonSessionStore } from './session/jsonSessionStore'
@@ -29,6 +32,8 @@ import { jsonTokenStore } from './auth/jsonTokenStore'
 import type { Executor, Flow } from './types'
 import type { LoopStore } from './loop/types'
 import type { ServerConfig } from './server'
+import type { StreamExecutor } from './chat/streamExecutor'
+import type { DaemonHub } from './daemon/daemonHub'
 
 /** The demo agent prompt; the fake executor's reply is keyed to it for determinism. */
 const DEMO_PROMPT = '用一句话友好地跟用户打个招呼,说明你是 Dittos 的 Loop Flow agent。'
@@ -49,6 +54,34 @@ export function buildExecutor(): Executor {
   return real
     ? claudeCliExecutor()
     : fakeExecutor({ replies: { [`claude:${DEMO_PROMPT}`]: { text: '你好!我是 Dittos 的 Loop Flow agent。' } } })
+}
+
+/** The daemon-mode wiring: one remote executor serving BOTH seams + the WS auth config. */
+export interface DaemonWiring {
+  hub: DaemonHub
+  /** Loop executor (Executor seam) — the same daemon executor object. */
+  executor: Executor
+  /** Chat stream executor (StreamExecutor seam) — the same daemon executor object. */
+  streamExecutor: StreamExecutor
+  /** ServerConfig.daemon: the hub the /daemon/ws endpoint registers conns into + the token hash. */
+  daemon: NonNullable<ServerConfig['daemon']>
+}
+
+/**
+ * DAEMON_MODE=1 (prod): the engine must NOT run `claude` (spec §3). Build a
+ * daemonHub + daemonExecutor and return it wired as BOTH the loop `executor` and
+ * the chat `streamExecutor` (the daemonExecutor object satisfies both seams), plus
+ * ServerConfig.daemon = { hub, tokenHash: sha256(DAEMON_TOKEN) } so the /daemon/ws
+ * endpoint can auth + register the local daemon's conn into the same hub the
+ * executor dispatches over. When DAEMON_MODE is unset → undefined (local dev keeps
+ * the in-process claude executors).
+ */
+export function buildDaemonWiring(): DaemonWiring | undefined {
+  if (process.env.DAEMON_MODE !== '1') return undefined
+  const hub = daemonHub()
+  const ex = daemonExecutor(hub)
+  const tokenHash = createHash('sha256').update(process.env.DAEMON_TOKEN ?? '').digest('hex')
+  return { hub, executor: ex, streamExecutor: ex, daemon: { hub, tokenHash } }
 }
 
 /**
@@ -79,7 +112,14 @@ export async function seedDemoLoop(store: LoopStore): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const executor = buildExecutor()
+  // Prod (DAEMON_MODE=1): the engine never runs `claude` — a local daemon does,
+  // linked over /daemon/ws. The daemonExecutor (one object) is wired as BOTH the
+  // loop executor AND the chat streamExecutor. Local dev (unset): in-process
+  // claude executors (claudeCli/claudeStream), unchanged.
+  const daemonWiring = buildDaemonWiring()
+  const executor = daemonWiring ? daemonWiring.executor : buildExecutor()
+  if (daemonWiring) console.log('mode: DAEMON_MODE — agent runs on the linked local daemon (engine runs no claude)')
+  else console.log('mode: local — in-process claude executor')
   const store = jsonLoopStore(process.env.LOOP_DATA_DIR || './.data/loops')
   const memoryDir = process.env.LOOP_MEMORY_DIR || './.data/memory'
   // Real session layer: loop runs open + mirror their narration into a persisted,
@@ -94,7 +134,8 @@ async function main(): Promise<void> {
   // /turns and the per-channel WS (spec §1-§3).
   const turnStore = jsonTurnStore(process.env.TURN_DATA_DIR || './.data/turns')
   const traceStore = jsonTraceStore(process.env.TRACE_DATA_DIR || './.data/trace')
-  const streamExecutor = claudeStreamExecutor()
+  // In DAEMON_MODE the chat stream goes to the daemon too; else the in-process claude stream.
+  const streamExecutor = daemonWiring ? daemonWiring.streamExecutor : claudeStreamExecutor()
   const auth = buildAuthConfig()
 
   const srv = createServer({
@@ -108,6 +149,7 @@ async function main(): Promise<void> {
     turnStore,
     traceStore,
     streamExecutor,
+    ...(daemonWiring ? { daemon: daemonWiring.daemon } : {}),
     ...(auth ? { auth } : {}),
     makeRunner: (emit, awaitApproval, sessionBus) => loopRunner({ store, executor, flows, emit, awaitApproval, sessionBus, notify: () => {}, defaultAgent: 'claude', memoryDir }),
   })

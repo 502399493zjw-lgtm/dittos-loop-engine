@@ -8,7 +8,8 @@
     "test": "vitest run",
     "build": "tsc -p tsconfig.json",
     "dev": "node --import tsx src/main.ts",
-    "serve": "node --import tsx src/serve.ts"
+    "serve": "node --import tsx src/serve.ts",
+    "daemon": "node --import tsx src/daemon/main.ts"
   },
   "dependencies": {
     "ws": "^8.18.0"
