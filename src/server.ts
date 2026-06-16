@@ -7,6 +7,7 @@ import type { EngineEvent, Executor, Flow, ApprovalRequest, ApprovalResult } fro
 import type { LoopSpec, LoopStore } from './loop/types'
 import type { LoopRunner } from './loop/loopRunner'
 import type { SessionBus } from './loop/sessionBus'
+import type { SessionStore } from './session/types'
 
 export interface ServerConfig {
   executor: Executor
@@ -15,6 +16,8 @@ export interface ServerConfig {
   storeDir?: string
   /** Loop persistence; required for the /loops endpoints. */
   store?: LoopStore
+  /** Session/chat persistence; required for the /sessions endpoints. */
+  sessionStore?: SessionStore
   /**
    * When set, each loop run opens a fresh chat session under its project and
    * auto-mirrors its narration into it; forwarded into the runner via makeRunner.
@@ -111,6 +114,47 @@ export function createServer(cfg: ServerConfig) {
         pendingApprovals.delete(key)
         resolve({ decision: decision ?? 'approve', note })
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+
+    // ---- sessions: read/write the chat layer so the frontend can drive it ----
+    if (method === 'POST' && url === '/sessions') {
+      if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
+      void readBody(req).then(async (body) => {
+        const { projectId, title } = JSON.parse(body || '{}') as { projectId?: string; title?: string }
+        const session = await cfg.sessionStore!.createSession(projectId, title !== undefined ? { title } : undefined)
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(session))
+      })
+      return
+    }
+
+    if (method === 'GET' && url.split('?')[0] === '/sessions') {
+      if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
+      const projectId = new URL(url, 'http://x').searchParams.get('projectId') ?? undefined
+      void cfg.sessionStore.listSessions(projectId).then((sessions) => {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(sessions))
+      })
+      return
+    }
+
+    const sessMessages = /^\/sessions\/([^/]+)\/messages$/.exec(url)
+    if (method === 'POST' && sessMessages) {
+      const sessionId = sessMessages[1]!
+      if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
+      void readBody(req).then(async (body) => {
+        const { sender, text } = JSON.parse(body || '{}') as { sender?: 'agent' | 'user'; text?: string }
+        const message = await cfg.sessionStore!.appendMessage(sessionId, { sender: sender ?? 'user', text: text ?? '' })
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(message))
+      })
+      return
+    }
+
+    if (method === 'GET' && sessMessages) {
+      const sessionId = sessMessages[1]!
+      if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
+      void cfg.sessionStore.getMessages(sessionId).then((messages) => {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(messages))
       })
       return
     }
