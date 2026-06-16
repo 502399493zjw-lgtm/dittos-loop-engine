@@ -68,4 +68,6 @@ export interface SessionStore {
   appendMessage(sessionId: string, msg: AppendMessageInput): Promise<Message>
   /** Messages for one session, chronological (ascending seq). */
   getMessages(sessionId: string): Promise<Message[]>
+  /** Set a session's display title (e.g. derived from its first user message). */
+  setTitle(sessionId: string, title: string): Promise<void>
 }

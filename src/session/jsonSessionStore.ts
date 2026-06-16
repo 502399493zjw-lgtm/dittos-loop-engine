@@ -86,5 +86,10 @@ export function jsonSessionStore(dir: string, opts?: { now?: () => number }): Se
       // Persisted in append order, which is chronological.
       return readAll<Message>(messagesFile).filter((m) => m.sessionId === sessionId)
     },
+    async setTitle(sessionId, title) {
+      const sessions = readAll<Session>(sessionsFile)
+      const s = sessions.find((x) => x.id === sessionId)
+      if (s) { s.title = title; writeAll(sessionsFile, sessions) }
+    },
   }
 }

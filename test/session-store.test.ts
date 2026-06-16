@@ -80,6 +80,18 @@ describe('jsonSessionStore', () => {
     expect((await s.getMessages(b.id)).map((m) => m.text)).toEqual(['for b'])
   })
 
+  it('setTitle updates a session title and persists', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ss-'))
+    const s = jsonSessionStore(dir, { now: clock() })
+    const sess = await s.createSession('proj-1')
+    await s.setTitle(sess.id, 'renamed')
+    expect((await s.listSessions('proj-1'))[0]?.title).toBe('renamed')
+    // No-op for an unknown id (does not throw).
+    await s.setTitle('nope', 'x')
+    const s2 = jsonSessionStore(dir, { now: clock() })
+    expect((await s2.listSessions('proj-1'))[0]?.title).toBe('renamed')
+  })
+
   it('persistence survives a fresh jsonSessionStore on the same dir', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ss-'))
     const s1 = jsonSessionStore(dir, { now: clock() })

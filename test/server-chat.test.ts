@@ -73,6 +73,32 @@ describe('server — chat endpoints', () => {
     await srv.close()
   })
 
+  it('the first user message names the session (first ~20 chars, … when longer)', async () => {
+    const { srv, sessionStore } = chatServer()
+    const { port } = await srv.listen(0)
+    const session = (await (await fetch(`http://localhost:${port}/sessions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    })).json()) as { id: string }
+
+    const long = 'Summarize the latest GitHub trending repos for me please'
+    await fetch(`http://localhost:${port}/channels/${session.id}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'text', content: { text: long } }),
+    })
+    const titled = (await sessionStore.listSessions()).find((s) => s.id === session.id)
+    expect(titled?.title).toBe(long.slice(0, 20) + '…')
+
+    // A second message does NOT rename the conversation.
+    await fetch(`http://localhost:${port}/channels/${session.id}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'text', content: { text: 'and the second one' } }),
+    })
+    const after = (await sessionStore.listSessions()).find((s) => s.id === session.id)
+    expect(after?.title).toBe(long.slice(0, 20) + '…')
+
+    await srv.close()
+  })
+
   it('a WS subscriber sees turn:created → ... → new_message(agent) → turn:update(completed) after POST', async () => {
     const { srv } = chatServer()
     const { port } = await srv.listen(0)

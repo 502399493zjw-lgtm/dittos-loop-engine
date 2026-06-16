@@ -338,6 +338,12 @@ export function createServer(cfg: ServerConfig) {
           content: { text: content?.text ?? '' },
           ...(reply_to !== undefined ? { reply_to } : {}),
         })
+        // The first message names the conversation (its first ~20 chars, … if
+        // longer) — like ChatGPT/Claude.ai. seq 0 = first message in the channel.
+        if (userMessage.seq === 0) {
+          const t = (content?.text ?? '').trim()
+          if (t) await cfg.sessionStore!.setTitle(channelId, t.length > 20 ? t.slice(0, 20) + '…' : t)
+        }
         // Mirror the user message to channel subscribers so other tabs see it too.
         emitForChannel(channelId)('new_message', { channel_id: channelId, message: userMessage })
         // Return the persisted user message immediately; the agent turn streams over WS.
