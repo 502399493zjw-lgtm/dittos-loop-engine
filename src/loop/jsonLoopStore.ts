@@ -21,10 +21,11 @@ export function jsonLoopStore(dir: string): LoopStore {
       write(spec.id, { spec, state: existing?.state ?? defaultState() })
     },
     async get(id) { return read(id) },
-    async list() {
-      return readdirSync(dir)
+    async list(ownerId) {
+      const all = readdirSync(dir)
         .filter((f) => f.endsWith('.json'))
         .map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')) as Persisted)
+      return ownerId === undefined ? all : all.filter((p) => p.spec.ownerId === ownerId)
     },
     async setState(id, patch) {
       const existing = read(id)

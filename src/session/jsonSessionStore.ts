@@ -29,6 +29,7 @@ export function jsonSessionStore(dir: string, opts?: { now?: () => number }): Se
         id: randomUUID(),
         ...(projectId !== undefined ? { projectId } : {}),
         ...(opts?.title !== undefined ? { title: opts.title } : {}),
+        ...(opts?.ownerId !== undefined ? { ownerId: opts.ownerId } : {}),
         createdAt: now(),
       }
       const sessions = readAll<Session>(sessionsFile)
@@ -36,9 +37,12 @@ export function jsonSessionStore(dir: string, opts?: { now?: () => number }): Se
       writeAll(sessionsFile, sessions)
       return session
     },
-    async listSessions(projectId) {
+    async listSessions(projectId, opts) {
       const sessions = readAll<Session>(sessionsFile)
-      return projectId === undefined ? sessions : sessions.filter((s) => s.projectId === projectId)
+      return sessions.filter((s) =>
+        (projectId === undefined || s.projectId === projectId) &&
+        (opts?.ownerId === undefined || s.ownerId === opts.ownerId),
+      )
     },
     async appendMessage(sessionId, msg) {
       const message: Message = { id: randomUUID(), sessionId, sender: msg.sender, text: msg.text, ts: now() }

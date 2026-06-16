@@ -8,6 +8,9 @@ import type { LoopSpec, LoopStore } from './loop/types'
 import type { LoopRunner } from './loop/loopRunner'
 import type { SessionBus } from './loop/sessionBus'
 import type { SessionStore } from './session/types'
+import type { GithubOAuth } from './auth/github'
+import type { UserStore, TokenStore } from './auth/types'
+import { signState, verifyState } from './auth/state'
 
 export interface ServerConfig {
   executor: Executor
@@ -31,6 +34,17 @@ export interface ServerConfig {
    * `sessionBus` (from cfg) is forwarded so loop runs can open + mirror to sessions.
    */
   makeRunner?: (emit: (e: EngineEvent) => void, awaitApproval: (req: ApprovalRequest) => Promise<ApprovalResult>, sessionBus?: SessionBus) => LoopRunner
+  /**
+   * GitHub-OAuth bearer auth. When set, the /auth/* endpoints are mounted and
+   * tokens are minted on callback. When unset (dev), no auth surface exists.
+   */
+  auth?: {
+    github: GithubOAuth
+    userStore: UserStore
+    tokenStore: TokenStore
+    sessionSecret: string
+    appBaseUrl: string
+  }
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -77,6 +91,24 @@ export function createServer(cfg: ServerConfig) {
 
   const runner = cfg.makeRunner?.(runnerEmit, makeAwaitApproval(), cfg.sessionBus)
 
+  // Bearer auth: resolve `Authorization: Bearer <t>` -> userId, or write 401.
+  // Returns the userId on success, or undefined after responding 401. The /loops
+  // and /sessions surfaces gate on this when cfg.auth is set; /auth/* stay public,
+  // and when cfg.auth is unset there is no gate at all (dev path unchanged).
+  async function resolveUserOr401(req: http.IncomingMessage, res: http.ServerResponse): Promise<string | undefined> {
+    const header = req.headers.authorization ?? ''
+    const token = header.startsWith('Bearer ') ? header.slice('Bearer '.length) : ''
+    const userId = token ? await cfg.auth!.tokenStore.resolve(token) : undefined
+    if (!userId) { res.writeHead(401).end(); return undefined }
+    return userId
+  }
+
+  // Paths gated by bearer auth (only when cfg.auth is set): /loops + /sessions and
+  // their sub-routes. /auth/* and everything else stay public.
+  const isGatedPath = (path: string) =>
+    path === '/loops' || path.startsWith('/loops/') ||
+    path === '/sessions' || path.startsWith('/sessions/')
+
   const httpServer = http.createServer((req, res) => {
     const url = req.url ?? ''
     const method = req.method ?? 'GET'
@@ -84,9 +116,18 @@ export function createServer(cfg: ServerConfig) {
     // ---- CORS: permissive so a browser frontend on another origin can call the API ----
     res.setHeader('access-control-allow-origin', '*')
     res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS')
-    res.setHeader('access-control-allow-headers', 'content-type')
+    res.setHeader('access-control-allow-headers', 'content-type,authorization')
     if (method === 'OPTIONS') { res.writeHead(204).end(); return } // preflight
 
+    // ---- auth gate: when configured, /loops + /sessions require a valid Bearer ----
+    // The resolved userId is threaded into dispatch so the gated routes scope by owner.
+    if (cfg.auth && isGatedPath(url.split('?')[0]!)) {
+      void resolveUserOr401(req, res).then((userId) => { if (userId) dispatch(userId) })
+      return
+    }
+    dispatch()
+
+    function dispatch(userId?: string) {
     // ---- P1: ad-hoc run ----
     if (method === 'POST' && url === '/runs') {
       void readBody(req).then((body) => {
@@ -123,7 +164,11 @@ export function createServer(cfg: ServerConfig) {
       if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
       void readBody(req).then(async (body) => {
         const { projectId, title } = JSON.parse(body || '{}') as { projectId?: string; title?: string }
-        const session = await cfg.sessionStore!.createSession(projectId, title !== undefined ? { title } : undefined)
+        const opts = {
+          ...(title !== undefined ? { title } : {}),
+          ...(userId !== undefined ? { ownerId: userId } : {}),
+        }
+        const session = await cfg.sessionStore!.createSession(projectId, Object.keys(opts).length ? opts : undefined)
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(session))
       })
       return
@@ -132,7 +177,7 @@ export function createServer(cfg: ServerConfig) {
     if (method === 'GET' && url.split('?')[0] === '/sessions') {
       if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
       const projectId = new URL(url, 'http://x').searchParams.get('projectId') ?? undefined
-      void cfg.sessionStore.listSessions(projectId).then((sessions) => {
+      void cfg.sessionStore.listSessions(projectId, userId !== undefined ? { ownerId: userId } : undefined).then((sessions) => {
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(sessions))
       })
       return
@@ -165,15 +210,17 @@ export function createServer(cfg: ServerConfig) {
       void readBody(req).then(async (body) => {
         const spec = JSON.parse(body || '{}') as LoopSpec
         if (!spec.id || !spec.flow) { res.writeHead(400).end('invalid loop spec'); return }
-        await cfg.store!.upsert(spec)
-        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: spec.id }))
+        // When auth is configured, stamp the loop with the authed owner so list scoping works.
+        const owned = userId !== undefined ? { ...spec, ownerId: userId } : spec
+        await cfg.store!.upsert(owned)
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: owned.id }))
       })
       return
     }
 
     if (method === 'GET' && url === '/loops') {
       if (!cfg.store) { res.writeHead(500).end('no loop store'); return }
-      void cfg.store.list().then((loops) => {
+      void cfg.store.list(userId).then((loops) => {
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(loops))
       })
       return
@@ -207,7 +254,56 @@ export function createServer(cfg: ServerConfig) {
       return
     }
 
+    // ---- auth: GitHub OAuth bearer (only mounted when configured) ----
+    if (cfg.auth) {
+      const { github, userStore, tokenStore, sessionSecret, appBaseUrl } = cfg.auth
+      const path = url.split('?')[0]
+
+      if (method === 'GET' && path === '/auth/login') {
+        res.writeHead(302, { location: github.authorizeUrl(signState(sessionSecret)) }).end()
+        return
+      }
+
+      if (method === 'GET' && path === '/auth/callback') {
+        const params = new URL(url, 'http://x').searchParams
+        const code = params.get('code') ?? ''
+        const state = params.get('state') ?? ''
+        if (!verifyState(state, sessionSecret)) {
+          res.writeHead(302, { location: `${appBaseUrl}#auth_error=bad_state` }).end()
+          return
+        }
+        // Wrap the exchange so a failing GitHub round-trip lands the user on an
+        // error hash, never a 500 dead end.
+        void (async () => {
+          try {
+            const accessToken = await github.exchangeCode(code)
+            const gh = await github.fetchUser(accessToken)
+            const user = await userStore.upsertByGithub(gh)
+            const token = await tokenStore.issue(user.id)
+            res.writeHead(302, { location: `${appBaseUrl}#token=${token}` }).end()
+          } catch (err) {
+            const reason = encodeURIComponent(err instanceof Error ? err.message : 'exchange_failed')
+            res.writeHead(302, { location: `${appBaseUrl}#auth_error=${reason}` }).end()
+          }
+        })()
+        return
+      }
+
+      if (method === 'GET' && path === '/auth/me') {
+        const header = req.headers.authorization ?? ''
+        const token = header.startsWith('Bearer ') ? header.slice('Bearer '.length) : ''
+        void (async () => {
+          const userId = token ? await tokenStore.resolve(token) : undefined
+          const user = userId ? await userStore.getById(userId) : undefined
+          if (!user) { res.writeHead(401).end(); return }
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(user))
+        })()
+        return
+      }
+    }
+
     res.writeHead(404).end()
+    }
   })
 
   const wss = new WebSocketServer({ server: httpServer })

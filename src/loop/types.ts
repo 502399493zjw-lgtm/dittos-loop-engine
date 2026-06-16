@@ -8,6 +8,8 @@ export interface LoopSpec {
   maxConsecutiveFailures?: number  // default 3
   /** Which project the loop belongs to; its runs' sessions open under it. */
   projectId?: string
+  /** The user who owns this loop; set by the HTTP surface when auth is configured. Unowned = visible to all (dev). */
+  ownerId?: string
 }
 export interface LoopState {
   cursor: unknown              // opaque; advanced by the flow via api.commit({cursor})
@@ -19,7 +21,8 @@ export interface LoopState {
 export interface LoopStore {
   upsert(spec: LoopSpec): Promise<void>
   get(id: string): Promise<{ spec: LoopSpec; state: LoopState } | undefined>
-  list(): Promise<Array<{ spec: LoopSpec; state: LoopState }>>
+  /** When ownerId is given, returns only that owner's loops; otherwise all of them. */
+  list(ownerId?: string): Promise<Array<{ spec: LoopSpec; state: LoopState }>>
   setState(id: string, patch: Partial<LoopState>): Promise<void>
 }
 export type Notify = (loopId: string, event: { kind: 'paused'; reason: 'failures' | 'budget'; detail: string }) => void

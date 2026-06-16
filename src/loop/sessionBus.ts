@@ -2,12 +2,12 @@
  *  session under its project and post messages into it (as the agent). The real
  *  impl wraps agent-im (later); tests use fakeSessionBus. */
 export interface SessionBus {
-  createSession(projectId: string | undefined, opts?: { title?: string }): Promise<{ sessionId: string }>
+  createSession(projectId: string | undefined, opts?: { title?: string; ownerId?: string }): Promise<{ sessionId: string }>
   postMessage(sessionId: string, text: string): Promise<void>
 }
 
 export type FakeSessionCall =
-  | { kind: 'create'; projectId: string | undefined; title?: string }
+  | { kind: 'create'; projectId: string | undefined; title?: string; ownerId?: string }
   | { kind: 'post'; sessionId: string; text: string }
 
 export interface FakeSessionBus extends SessionBus {
@@ -21,7 +21,7 @@ export function fakeSessionBus(): FakeSessionBus {
     calls,
     async createSession(projectId, opts) {
       const sessionId = `sess-${++n}`
-      calls.push({ kind: 'create', projectId, ...(opts?.title ? { title: opts.title } : {}) })
+      calls.push({ kind: 'create', projectId, ...(opts?.title ? { title: opts.title } : {}), ...(opts?.ownerId ? { ownerId: opts.ownerId } : {}) })
       return { sessionId }
     },
     async postMessage(sessionId, text) {

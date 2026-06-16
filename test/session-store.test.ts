@@ -29,6 +29,29 @@ describe('jsonSessionStore', () => {
     expect((await s.listSessions()).length).toBe(3)
   })
 
+  it('createSession records ownerId and listSessions filters by owner', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ss-'))
+    const s = jsonSessionStore(dir, { now: clock() })
+    const a = await s.createSession('proj-1', { ownerId: 'A' })
+    await s.createSession('proj-1', { ownerId: 'B' })
+    await s.createSession('proj-1') // unowned
+    expect(a.ownerId).toBe('A')
+    expect((await s.listSessions(undefined, { ownerId: 'A' })).map((x) => x.id)).toEqual([a.id])
+    expect((await s.listSessions(undefined, { ownerId: 'B' })).length).toBe(1)
+    expect((await s.listSessions()).length).toBe(3)
+  })
+
+  it('listSessions can filter by owner and project together', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ss-'))
+    const s = jsonSessionStore(dir, { now: clock() })
+    await s.createSession('proj-1', { ownerId: 'A' })
+    await s.createSession('proj-2', { ownerId: 'A' })
+    await s.createSession('proj-1', { ownerId: 'B' })
+    const got = await s.listSessions('proj-1', { ownerId: 'A' })
+    expect(got.map((x) => x.projectId)).toEqual(['proj-1'])
+    expect(got.map((x) => x.ownerId)).toEqual(['A'])
+  })
+
   it('appendMessage returns a Message and getMessages returns them chronologically', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ss-'))
     const s = jsonSessionStore(dir, { now: clock() })

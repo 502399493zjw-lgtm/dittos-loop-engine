@@ -19,8 +19,12 @@ import { jsonLoopStore } from './loop/jsonLoopStore'
 import { loopRunner } from './loop/loopRunner'
 import { jsonSessionStore } from './session/jsonSessionStore'
 import { storeSessionBus } from './session/storeSessionBus'
+import { githubOAuth } from './auth/github'
+import { jsonUserStore } from './auth/jsonUserStore'
+import { jsonTokenStore } from './auth/jsonTokenStore'
 import type { Executor, Flow } from './types'
 import type { LoopStore } from './loop/types'
+import type { ServerConfig } from './server'
 
 /** The demo agent prompt; the fake executor's reply is keyed to it for determinism. */
 const DEMO_PROMPT = '用一句话友好地跟用户打个招呼,说明你是 Dittos 的 Loop Flow agent。'
@@ -43,6 +47,27 @@ export function buildExecutor(): Executor {
     : fakeExecutor({ replies: { [`claude:${DEMO_PROMPT}`]: { text: '你好!我是 Dittos 的 Loop Flow agent。' } } })
 }
 
+/**
+ * Build the GitHub-OAuth auth config from env, but ONLY when GITHUB_CLIENT_ID is
+ * set. Open-source deployers bring their own GitHub app via env; with no app
+ * configured (dev) auth stays off and the /auth/* surface is absent.
+ */
+export function buildAuthConfig(): ServerConfig['auth'] | undefined {
+  if (!process.env.GITHUB_CLIENT_ID) return undefined
+  const github = githubOAuth({
+    clientId: process.env.GITHUB_CLIENT_ID,
+    clientSecret: process.env.GITHUB_CLIENT_SECRET || '',
+    callbackUrl: process.env.GITHUB_CALLBACK_URL || '',
+  })
+  return {
+    github,
+    userStore: jsonUserStore(process.env.AUTH_DATA_DIR || './.data/users'),
+    tokenStore: jsonTokenStore(process.env.AUTH_DATA_DIR || './.data/tokens'),
+    sessionSecret: process.env.SESSION_SECRET || 'dev-secret',
+    appBaseUrl: process.env.APP_BASE_URL || 'http://localhost:5173',
+  }
+}
+
 /** Seed the demo loop without clobbering an existing one (idempotent across restarts). */
 export async function seedDemoLoop(store: LoopStore): Promise<void> {
   const existing = await store.get('demo-loop')
@@ -57,6 +82,7 @@ async function main(): Promise<void> {
   // project-scoped session; the /sessions endpoints read/write the same store.
   const sessionStore = jsonSessionStore(process.env.SESSION_DATA_DIR || './.data/sessions')
   const sessionBus = storeSessionBus(sessionStore)
+  const auth = buildAuthConfig()
 
   const srv = createServer({
     executor,
@@ -65,6 +91,7 @@ async function main(): Promise<void> {
     store,
     sessionStore,
     sessionBus,
+    ...(auth ? { auth } : {}),
     makeRunner: (emit, awaitApproval, sessionBus) => loopRunner({ store, executor, flows, emit, awaitApproval, sessionBus, notify: () => {}, defaultAgent: 'claude', memoryDir }),
   })
 

@@ -56,4 +56,15 @@ describe('jsonLoopStore', () => {
     const s = jsonLoopStore(dir)
     expect(await s.list()).toEqual([])
   })
+
+  it('list(ownerId) returns only that owner\'s loops; list() returns all', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ls-'))
+    const s = jsonLoopStore(dir)
+    await s.upsert({ ...spec('a'), ownerId: 'A' })
+    await s.upsert({ ...spec('b'), ownerId: 'B' })
+    await s.upsert(spec('c')) // unowned
+    expect((await s.list('A')).map((x) => x.spec.id)).toEqual(['a'])
+    expect((await s.list('B')).map((x) => x.spec.id)).toEqual(['b'])
+    expect((await s.list()).map((x) => x.spec.id).sort()).toEqual(['a', 'b', 'c'])
+  })
 })

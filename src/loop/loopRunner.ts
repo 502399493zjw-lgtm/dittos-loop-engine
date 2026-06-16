@@ -60,7 +60,7 @@ export function loopRunner(deps: LoopRunnerDeps): LoopRunner {
       const bus = deps.sessionBus
       let sessionId: string | undefined
       if (bus) {
-        ;({ sessionId } = await bus.createSession(spec.projectId, { title: spec.id }))
+        ;({ sessionId } = await bus.createSession(spec.projectId, { title: spec.id, ...(spec.ownerId !== undefined ? { ownerId: spec.ownerId } : {}) }))
         await bus.postMessage(sessionId, kickoffMessage(describeTrigger(spec.trigger, cause)))
       }
 
