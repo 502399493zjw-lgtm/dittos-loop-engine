@@ -57,7 +57,7 @@ async function main(): Promise<void> {
     defaultAgent: 'claude',
     flows,
     store,
-    makeRunner: (emit) => loopRunner({ store, executor, flows, emit, notify: () => {}, defaultAgent: 'claude', memoryDir }),
+    makeRunner: (emit, awaitApproval) => loopRunner({ store, executor, flows, emit, awaitApproval, notify: () => {}, defaultAgent: 'claude', memoryDir }),
   })
 
   await seedDemoLoop(store)

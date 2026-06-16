@@ -1,4 +1,4 @@
-import type { EngineEvent, FlowApi, Flow, RunDeps, RunStatus, AgentOpts, Memory } from '../types'
+import type { EngineEvent, FlowApi, Flow, RunDeps, RunStatus, AgentOpts, Memory, ApprovalResult } from '../types'
 import { makeIdGen, wallClock } from './ids'
 
 /** In-process memory used when a run has no injected (file-backed) memory. */
@@ -56,9 +56,22 @@ export async function runFlow(flow: Flow, deps: RunDeps): Promise<{ status: RunS
     return parsed
   }
 
+  // Human-in-the-loop gate: emit a request, await the injected resolver (or auto-approve so flows never hang), emit the resolution.
+  async function approval(prompt: string, opts: { options?: string[] } = {}): Promise<ApprovalResult> {
+    const approvalId = nextId('apr')
+    const nodeId = nextId('node')
+    emit({ type: 'approval_requested', runId, approvalId, nodeId, prompt, options: opts.options, ts: now() })
+    const result = deps.awaitApproval
+      ? await deps.awaitApproval({ runId, approvalId, prompt, options: opts.options })
+      : { decision: opts.options?.[0] ?? 'approve' }
+    emit({ type: 'approval_resolved', runId, approvalId, decision: result.decision, note: result.note, ts: now() })
+    return result
+  }
+
   const api: FlowApi & { __runAgent: typeof runAgent } = {
     __runAgent: runAgent,
     agent: runAgent,
+    approval,
     phase(title: string) {
       if (activePhase) emit({ type: 'phase_done', runId, phaseId: activePhase, status: 'ok', ts: now() })
       activePhase = nextId('phase')

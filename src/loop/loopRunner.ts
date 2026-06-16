@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { runFlow } from '../engine/runtime'
 import { memoryFile } from './memoryFile'
-import type { Executor, EngineEvent, Flow } from '../types'
+import type { Executor, EngineEvent, Flow, ApprovalRequest, ApprovalResult } from '../types'
 import type { LoopStore, Notify } from './types'
 
 export interface LoopRunnerDeps {
@@ -14,6 +14,8 @@ export interface LoopRunnerDeps {
   defaultAgent: string
   /** dir holding each loop's `<loopId>.md` ratchet memory */
   memoryDir: string
+  /** resolves an approval gate; forwarded into runFlow so loop-triggered runs honour human-in-the-loop gates */
+  awaitApproval?: (req: ApprovalRequest) => Promise<ApprovalResult>
   /** injectable clock for deterministic tests */
   now?: () => number
 }
@@ -61,6 +63,7 @@ export function loopRunner(deps: LoopRunnerDeps): LoopRunner {
         args: { cursor: state.cursor },
         budgetUsd: spec.budgetUsd,
         memory,
+        awaitApproval: deps.awaitApproval,
         emit,
       })
 

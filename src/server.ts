@@ -3,7 +3,7 @@ import { WebSocketServer } from 'ws'
 import { randomUUID } from 'node:crypto'
 import { runFlow } from './engine/runtime'
 import { jsonStore } from './store/jsonStore'
-import type { EngineEvent, Executor, Flow } from './types'
+import type { EngineEvent, Executor, Flow, ApprovalRequest, ApprovalResult } from './types'
 import type { LoopSpec, LoopStore } from './loop/types'
 import type { LoopRunner } from './loop/loopRunner'
 
@@ -18,8 +18,9 @@ export interface ServerConfig {
    * Build the loop runner, wiring its event sink so a loop's run events flow
    * through the same per-run buffer/WS plumbing as ad-hoc /runs. The runner
    * picks the run id internally; the server keys events by `e.runId`.
+   * `awaitApproval` is forwarded so loop-triggered runs honour the same gates as /runs.
    */
-  makeRunner?: (emit: (e: EngineEvent) => void) => LoopRunner
+  makeRunner?: (emit: (e: EngineEvent) => void, awaitApproval: (req: ApprovalRequest) => Promise<ApprovalResult>) => LoopRunner
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -58,7 +59,13 @@ export function createServer(cfg: ServerConfig) {
     emitFor(e.runId)(e)
   }
 
-  const runner = cfg.makeRunner?.(runnerEmit)
+  // Parked approval gates keyed by `${runId}:${approvalId}`. api.approval's awaitApproval
+  // registers a resolver here; the POST /runs/:id/approvals/:id route fulfils it.
+  const pendingApprovals = new Map<string, (r: ApprovalResult) => void>()
+  const makeAwaitApproval = () => (req: ApprovalRequest) =>
+    new Promise<ApprovalResult>((resolve) => pendingApprovals.set(`${req.runId}:${req.approvalId}`, resolve))
+
+  const runner = cfg.makeRunner?.(runnerEmit, makeAwaitApproval())
 
   const httpServer = http.createServer((req, res) => {
     const url = req.url ?? ''
@@ -79,7 +86,24 @@ export function createServer(cfg: ServerConfig) {
         const runId = randomUUID()
         buffer.set(runId, [])
         res.writeHead(202, { 'content-type': 'application/json' }).end(JSON.stringify({ runId }))
-        void runFlow(f, { runId, executor: cfg.executor, defaultAgent: cfg.defaultAgent, args, emit: emitFor(runId) })
+        void runFlow(f, { runId, executor: cfg.executor, defaultAgent: cfg.defaultAgent, args, awaitApproval: makeAwaitApproval(), emit: emitFor(runId) })
+      })
+      return
+    }
+
+    // ---- resolve a parked approval gate (CORS headers above cover this route) ----
+    const approve = /^\/runs\/([^/]+)\/approvals\/([^/]+)$/.exec(url)
+    if (method === 'POST' && approve) {
+      const runId = approve[1]!
+      const approvalId = approve[2]!
+      void readBody(req).then((body) => {
+        const { decision, note } = JSON.parse(body || '{}') as { decision?: string; note?: string }
+        const key = `${runId}:${approvalId}`
+        const resolve = pendingApprovals.get(key)
+        if (!resolve) { res.writeHead(404).end('no pending approval'); return }
+        pendingApprovals.delete(key)
+        resolve({ decision: decision ?? 'approve', note })
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true }))
       })
       return
     }

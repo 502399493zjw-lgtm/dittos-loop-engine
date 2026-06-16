@@ -44,8 +44,8 @@ function loopServer(flows: Record<string, Flow>) {
     flows,
     storeDir: undefined,
     store,
-    makeRunner: (emit: (e: EngineEvent) => void) =>
-      loopRunner({ store, executor, flows, emit, notify: () => {}, defaultAgent: 'claude', memoryDir: memDir }),
+    makeRunner: (emit: (e: EngineEvent) => void, awaitApproval) =>
+      loopRunner({ store, executor, flows, emit, awaitApproval, notify: () => {}, defaultAgent: 'claude', memoryDir: memDir }),
   })
   return { srv, store, dir, memDir }
 }
@@ -126,6 +126,53 @@ describe('server — loop endpoints', () => {
     const { srv } = loopServer({ demo: async () => 'ok' })
     const { port } = await srv.listen(0)
     const res = await fetch(`http://localhost:${port}/loops/nope/trigger`, { method: 'POST' })
+    expect(res.status).toBe(404)
+    await srv.close()
+  })
+})
+
+describe('server — approvals', () => {
+  it('POST /runs/:id/approvals/:approvalId resolves a gate so the run completes', async () => {
+    // A flow that blocks on a human gate; the WS-driven POST below is what lets it finish.
+    const flow: Flow = async (api) => { const r = await api.approval('proceed?'); return `done:${r.decision}` }
+    const srv = createServer({ executor: fakeExecutor(), defaultAgent: 'claude', flows: { gated: flow }, storeDir: undefined })
+    const { port } = await srv.listen(0)
+
+    const res = await fetch(`http://localhost:${port}/runs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ flow: 'gated', args: {} }) })
+    const { runId } = (await res.json()) as { runId: string }
+
+    let approvePost: Response | undefined
+    const types: string[] = await new Promise((resolve) => {
+      const ws = new WebSocket(`ws://localhost:${port}/runs/${runId}/events`)
+      const seen: string[] = []
+      ws.on('message', (d) => {
+        const e = JSON.parse(d.toString())
+        seen.push(e.type)
+        if (e.type === 'approval_requested') {
+          // Until this POST lands the run must stay parked on the gate (server-wired awaitApproval).
+          expect(seen).not.toContain('approval_resolved')
+          void fetch(`http://localhost:${port}/runs/${runId}/approvals/${e.approvalId}`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'approve' }),
+          }).then((r) => { approvePost = r })
+        }
+        if (e.type === 'run_done') { ws.close(); resolve(seen) }
+      })
+    })
+
+    expect(approvePost?.status).toBe(200)
+    expect(types).toContain('approval_requested')
+    expect(types).toContain('approval_resolved')
+    expect(types).toContain('run_done')
+
+    await srv.close()
+  })
+
+  it('POST /runs/:id/approvals/:approvalId 404s when no approval is pending', async () => {
+    const srv = createServer({ executor: fakeExecutor(), defaultAgent: 'claude', flows: { demo: async () => 'ok' }, storeDir: undefined })
+    const { port } = await srv.listen(0)
+    const res = await fetch(`http://localhost:${port}/runs/nope/approvals/nope`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'approve' }),
+    })
     expect(res.status).toBe(404)
     await srv.close()
   })

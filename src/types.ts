@@ -13,6 +13,17 @@ export interface AgentOpts {
   phase?: string
 }
 
+export interface ApprovalRequest {
+  runId: string
+  approvalId: string
+  prompt: string
+  options?: string[]
+}
+export interface ApprovalResult {
+  decision: string
+  note?: string
+}
+
 export interface ExecutorRequest {
   agentId: string
   prompt: string
@@ -38,6 +49,8 @@ export type EngineEvent =
   | { type: 'phase_done'; runId: string; phaseId: string; status: 'ok' | 'failed'; ts: number }
   | { type: 'log'; runId: string; message: string; ts: number }
   | { type: 'budget_exceeded'; runId: string; spent: number; cap: number; ts: number }
+  | { type: 'approval_requested'; runId: string; approvalId: string; nodeId: string; prompt: string; options?: string[]; ts: number }
+  | { type: 'approval_resolved'; runId: string; approvalId: string; decision: string; note?: string; ts: number }
   | { type: 'run_done'; runId: string; status: RunStatus; summary?: string; result?: unknown; ts: number }
 
 /** A per-loop ratcheting memory surface (read full text / append a line). */
@@ -48,6 +61,8 @@ export interface Memory {
 
 export interface FlowApi {
   agent(prompt: string, opts?: AgentOpts): Promise<string | Record<string, unknown>>
+  /** Human-in-the-loop gate; auto-approves to options[0] (or 'approve') when no awaiter is wired. */
+  approval(prompt: string, opts?: { options?: string[] }): Promise<ApprovalResult>
   parallel<T>(thunks: Array<() => Promise<T>>): Promise<Array<T | null>>
   pipeline(items: unknown[], ...stages: Array<(prev: unknown, item: unknown, i: number) => Promise<unknown>>): Promise<unknown[]>
   phase(title: string): void
@@ -70,6 +85,8 @@ export interface RunDeps {
   /** per-loop memory surface; when absent the run gets an in-process noop */
   memory?: Memory
   emit: (e: EngineEvent) => void
+  /** resolves an approval gate; when absent api.approval auto-approves so flows never hang */
+  awaitApproval?: (req: ApprovalRequest) => Promise<ApprovalResult>
   /** injectable for deterministic tests */
   now?: () => number
   nextId?: (prefix: string) => string
