@@ -18,6 +18,7 @@ import { fakeExecutor } from './executor/fake'
 import { jsonLoopStore } from './loop/jsonLoopStore'
 import { loopRunner } from './loop/loopRunner'
 import { jsonSessionStore } from './session/jsonSessionStore'
+import { jsonProjectStore } from './project/jsonProjectStore'
 import { storeSessionBus } from './session/storeSessionBus'
 import { jsonTurnStore } from './chat/turnStore'
 import { jsonTraceStore } from './chat/traceStore'
@@ -85,6 +86,9 @@ async function main(): Promise<void> {
   // project-scoped session; the /sessions endpoints read/write the same store.
   const sessionStore = jsonSessionStore(process.env.SESSION_DATA_DIR || './.data/sessions')
   const sessionBus = storeSessionBus(sessionStore)
+  // Project layer: a named owner-scoped container the frontend uses to group
+  // sessions; the /projects endpoints read/write this store.
+  const projectStore = jsonProjectStore(process.env.PROJECT_DATA_DIR || './.data/projects')
   // Chat slice: turn + trace stores (JSON under ./.data) + the real `claude -p
   // stream-json` executor. Together with sessionStore they enable /channels +
   // /turns and the per-channel WS (spec §1-§3).
@@ -99,6 +103,7 @@ async function main(): Promise<void> {
     flows,
     store,
     sessionStore,
+    projectStore,
     sessionBus,
     turnStore,
     traceStore,
@@ -118,6 +123,10 @@ async function main(): Promise<void> {
   console.log(`  POST ${base}/loops/:id/resume`)
   console.log(`  POST ${base}/sessions`)
   console.log(`  GET  ${base}/sessions`)
+  console.log(`  GET  ${base}/projects`)
+  console.log(`  POST ${base}/projects`)
+  console.log(`  PATCH  ${base}/projects/:id`)
+  console.log(`  DELETE ${base}/projects/:id`)
   console.log(`  POST ${base}/sessions/:id/messages`)
   console.log(`  GET  ${base}/sessions/:id/messages`)
   console.log(`  POST ${base}/channels/:id/messages`)

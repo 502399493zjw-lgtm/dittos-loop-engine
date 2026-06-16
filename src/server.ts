@@ -8,6 +8,7 @@ import type { LoopSpec, LoopStore } from './loop/types'
 import type { LoopRunner } from './loop/loopRunner'
 import type { SessionBus } from './loop/sessionBus'
 import type { SessionStore } from './session/types'
+import type { ProjectStore } from './project/types'
 import type { TurnStore, TraceStore } from './chat/types'
 import type { StreamExecutor } from './chat/streamExecutor'
 import { respondToMessage } from './chat/respond'
@@ -24,6 +25,8 @@ export interface ServerConfig {
   store?: LoopStore
   /** Session/chat persistence; required for the /sessions endpoints. */
   sessionStore?: SessionStore
+  /** Project persistence; required for the /projects endpoints. */
+  projectStore?: ProjectStore
   /**
    * Chat slice (standalone-chat wire contract, spec §1-§3). The /channels +
    * /turns endpoints and the per-channel WS are enabled when turnStore +
@@ -151,6 +154,7 @@ export function createServer(cfg: ServerConfig) {
   const isGatedPath = (path: string) =>
     path === '/loops' || path.startsWith('/loops/') ||
     path === '/sessions' || path.startsWith('/sessions/') ||
+    path === '/projects' || path.startsWith('/projects/') ||
     path === '/channels' || path.startsWith('/channels/') ||
     path === '/turns' || path.startsWith('/turns/')
 
@@ -160,7 +164,7 @@ export function createServer(cfg: ServerConfig) {
 
     // ---- CORS: permissive so a browser frontend on another origin can call the API ----
     res.setHeader('access-control-allow-origin', '*')
-    res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS')
+    res.setHeader('access-control-allow-methods', 'GET,POST,PATCH,DELETE,OPTIONS')
     res.setHeader('access-control-allow-headers', 'content-type,authorization')
     if (method === 'OPTIONS') { res.writeHead(204).end(); return } // preflight
 
@@ -245,6 +249,47 @@ export function createServer(cfg: ServerConfig) {
       if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
       void cfg.sessionStore.getMessages(sessionId).then((messages) => {
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(messages))
+      })
+      return
+    }
+
+    // ---- projects: minimal owner-scoped CRUD so the frontend can group sessions ----
+    if (method === 'POST' && url === '/projects') {
+      if (!cfg.projectStore) { res.writeHead(500).end('no project store'); return }
+      void readBody(req).then(async (body) => {
+        const { name } = JSON.parse(body || '{}') as { name?: string }
+        const project = await cfg.projectStore!.create(userId, name ?? '')
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(project))
+      })
+      return
+    }
+
+    if (method === 'GET' && url.split('?')[0] === '/projects') {
+      if (!cfg.projectStore) { res.writeHead(500).end('no project store'); return }
+      void cfg.projectStore.list(userId).then((projects) => {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(projects))
+      })
+      return
+    }
+
+    const projGet = /^\/projects\/([^/]+)$/.exec(url.split('?')[0]!)
+    if (method === 'PATCH' && projGet) {
+      const id = projGet[1]!
+      if (!cfg.projectStore) { res.writeHead(500).end('no project store'); return }
+      void readBody(req).then(async (body) => {
+        const { name } = JSON.parse(body || '{}') as { name?: string }
+        const project = await cfg.projectStore!.rename(id, name ?? '')
+        if (!project) { res.writeHead(404).end('unknown project'); return }
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(project))
+      })
+      return
+    }
+
+    if (method === 'DELETE' && projGet) {
+      const id = projGet[1]!
+      if (!cfg.projectStore) { res.writeHead(500).end('no project store'); return }
+      void cfg.projectStore.remove(id).then((ok) => {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok }))
       })
       return
     }
