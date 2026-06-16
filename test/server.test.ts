@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest'
+import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path'
 import { createServer } from '../src/server'
 import { fakeExecutor } from '../src/executor/fake'
+import { jsonLoopStore } from '../src/loop/jsonLoopStore'
+import { loopRunner } from '../src/loop/loopRunner'
+import type { LoopSpec } from '../src/loop/types'
+import type { EngineEvent, Flow } from '../src/types'
 import WebSocket from 'ws'
 
 describe('server', () => {
@@ -16,6 +21,112 @@ describe('server', () => {
       ws.on('message', (d) => { const e = JSON.parse(d.toString()); types.push(e.type); if (e.type === 'run_done') { ws.close(); resolve(types) } })
     })
     expect(got).toContain('run_done')
+    await srv.close()
+  })
+})
+
+// ---- Task 6: loop CRUD + trigger + resume ----
+
+const loopSpec = (over: Partial<LoopSpec> = {}): LoopSpec => ({
+  id: 'L1', flow: 'demo', trigger: { kind: 'interval', everyMs: 1000 }, ...over,
+})
+
+function loopServer(flows: Record<string, Flow>) {
+  const dir = mkdtempSync(join(tmpdir(), 'srv-loop-'))
+  const memDir = mkdtempSync(join(tmpdir(), 'srv-mem-'))
+  const store = jsonLoopStore(dir)
+  const executor = fakeExecutor()
+  // The server constructs the runner via makeRunner so the runner's events flow
+  // through the server's per-run buffer/WS plumbing (keyed by the run id the runner used).
+  const srv = createServer({
+    executor,
+    defaultAgent: 'claude',
+    flows,
+    storeDir: undefined,
+    store,
+    makeRunner: (emit: (e: EngineEvent) => void) =>
+      loopRunner({ store, executor, flows, emit, notify: () => {}, defaultAgent: 'claude', memoryDir: memDir }),
+  })
+  return { srv, store, dir, memDir }
+}
+
+describe('server — loop endpoints', () => {
+  it('POST /loops creates+stores a loop, GET /loops lists it with state', async () => {
+    const flow: Flow = async () => 'ok'
+    const { srv, store } = loopServer({ demo: flow })
+    const { port } = await srv.listen(0)
+
+    const create = await fetch(`http://localhost:${port}/loops`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(loopSpec()),
+    })
+    expect(create.status).toBe(200)
+
+    const stored = await store.get('L1')
+    expect(stored?.spec.flow).toBe('demo')
+    expect(stored?.state).toMatchObject({ cursor: null, consecutiveFailures: 0, paused: false })
+
+    const list = await fetch(`http://localhost:${port}/loops`)
+    const body = (await list.json()) as Array<{ spec: LoopSpec; state: { paused: boolean } }>
+    expect(body).toHaveLength(1)
+    expect(body[0]?.spec.id).toBe('L1')
+    expect(body[0]?.state.paused).toBe(false)
+
+    await srv.close()
+  })
+
+  it('POST /loops/:id/trigger runs one tick and streams that run over WS', async () => {
+    const flow: Flow = async (api) => { api.phase('p'); await api.agent('hi'); return 'ok' }
+    const { srv, store } = loopServer({ demo: flow })
+    const { port } = await srv.listen(0)
+    await fetch(`http://localhost:${port}/loops`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(loopSpec()),
+    })
+
+    const trig = await fetch(`http://localhost:${port}/loops/L1/trigger`, { method: 'POST' })
+    const { runId } = (await trig.json()) as { runId: string }
+    expect(typeof runId).toBe('string')
+
+    const types: string[] = await new Promise((resolve) => {
+      const ws = new WebSocket(`ws://localhost:${port}/runs/${runId}/events`)
+      const seen: string[] = []
+      ws.on('message', (d) => { const e = JSON.parse(d.toString()); seen.push(e.type); if (e.type === 'run_done') { ws.close(); resolve(seen) } })
+    })
+    expect(types).toContain('agent_started')
+    expect(types).toContain('run_done')
+
+    // tick ran: lastRunAt recorded
+    const stored = await store.get('L1')
+    expect(stored?.state.lastRunAt).toBeTypeOf('number')
+
+    await srv.close()
+  })
+
+  it('POST /loops/:id/resume clears paused + resets failures', async () => {
+    const flow: Flow = async () => 'ok'
+    const { srv, store } = loopServer({ demo: flow })
+    const { port } = await srv.listen(0)
+    await fetch(`http://localhost:${port}/loops`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(loopSpec()),
+    })
+    await store.setState('L1', { paused: true, pausedReason: 'failures', consecutiveFailures: 3 })
+
+    const resume = await fetch(`http://localhost:${port}/loops/L1/resume`, { method: 'POST' })
+    expect(resume.status).toBe(200)
+
+    const stored = await store.get('L1')
+    expect(stored?.state.paused).toBe(false)
+    expect(stored?.state.consecutiveFailures).toBe(0)
+    expect(stored?.state.pausedReason).toBeUndefined()
+
+    await srv.close()
+  })
+
+  it('POST /loops/:id/trigger on an unknown loop 404s', async () => {
+    const { srv } = loopServer({ demo: async () => 'ok' })
+    const { port } = await srv.listen(0)
+    const res = await fetch(`http://localhost:${port}/loops/nope/trigger`, { method: 'POST' })
+    expect(res.status).toBe(404)
     await srv.close()
   })
 })
