@@ -12,12 +12,12 @@
  * fire when this module is the process entrypoint.
  */
 import { fileURLToPath } from 'node:url'
-import { createHash } from 'node:crypto'
 import { createServer } from './server'
 import { claudeCliExecutor } from './executor/claudeCli'
 import { fakeExecutor } from './executor/fake'
 import { daemonHub } from './daemon/daemonHub'
 import { daemonExecutor } from './daemon/daemonExecutor'
+import { jsonDaemonTokenStore } from './daemon/daemonTokenStore'
 import { jsonLoopStore } from './loop/jsonLoopStore'
 import { loopRunner } from './loop/loopRunner'
 import { jsonSessionStore } from './session/jsonSessionStore'
@@ -63,25 +63,25 @@ export interface DaemonWiring {
   executor: Executor
   /** Chat stream executor (StreamExecutor seam) — the same daemon executor object. */
   streamExecutor: StreamExecutor
-  /** ServerConfig.daemon: the hub the /daemon/ws endpoint registers conns into + the token hash. */
+  /** ServerConfig.daemon: the hub the /daemon/ws endpoint registers conns into + the per-user token store. */
   daemon: NonNullable<ServerConfig['daemon']>
 }
 
 /**
- * DAEMON_MODE=1 (prod): the engine must NOT run `claude` (spec §3). Build a
+ * DAEMON_MODE=1 (prod): the engine must NOT run `claude` (spec §1). Build a
  * daemonHub + daemonExecutor and return it wired as BOTH the loop `executor` and
  * the chat `streamExecutor` (the daemonExecutor object satisfies both seams), plus
- * ServerConfig.daemon = { hub, tokenHash: sha256(DAEMON_TOKEN) } so the /daemon/ws
- * endpoint can auth + register the local daemon's conn into the same hub the
- * executor dispatches over. When DAEMON_MODE is unset → undefined (local dev keeps
- * the in-process claude executors).
+ * ServerConfig.daemon = { hub, daemonTokenStore } so the /daemon/ws endpoint can
+ * resolve a per-user `?token=` to its userId + register the local daemon's conn
+ * (keyed by userId) into the same hub the executor dispatches over. When
+ * DAEMON_MODE is unset → undefined (local dev keeps the in-process claude executors).
  */
 export function buildDaemonWiring(): DaemonWiring | undefined {
   if (process.env.DAEMON_MODE !== '1') return undefined
   const hub = daemonHub()
   const ex = daemonExecutor(hub)
-  const tokenHash = createHash('sha256').update(process.env.DAEMON_TOKEN ?? '').digest('hex')
-  return { hub, executor: ex, streamExecutor: ex, daemon: { hub, tokenHash } }
+  const daemonTokenStore = jsonDaemonTokenStore(process.env.DAEMON_DATA_DIR || './.data/daemon-tokens')
+  return { hub, executor: ex, streamExecutor: ex, daemon: { hub, daemonTokenStore } }
 }
 
 /**

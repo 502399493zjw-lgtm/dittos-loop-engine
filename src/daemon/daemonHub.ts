@@ -1,9 +1,10 @@
 /**
- * daemonHub — tracks the (single) connected daemon conn and correlates turns
- * by turnId (spec §3). The engine's daemonExecutor calls `dispatch` to send an
- * `agent:run`; the server routes inbound daemon messages (turn:start /
- * trace:batch / turn:end) back in via `handleMessage`. One daemon per engine
- * (slim) — registering a second conn replaces the first.
+ * daemonHub — tracks the connected daemon conns KEYED BY userId and correlates
+ * turns by turnId (spec §1). Each user links their OWN local daemon; the engine's
+ * daemonExecutor calls `dispatch(userId, ...)` to send an `agent:run` to that
+ * user's conn, and the server routes inbound daemon messages (turn:start /
+ * trace:batch / turn:end) back in via `handleMessage`. Registering a second conn
+ * for the same user replaces the first; distinct users are independent.
  */
 import type { MappedEvent } from '../chat/streamExecutor'
 import type {
@@ -12,7 +13,7 @@ import type {
 } from './protocol'
 
 /**
- * Transport-agnostic handle to the connected daemon. The server adapts a WS to
+ * Transport-agnostic handle to a connected daemon. The server adapts a WS to
  * this shape; tests pass a fake that scripts the daemon's replies. `send` must
  * serialize the engine→daemon message onto the wire.
  */
@@ -36,59 +37,75 @@ export interface DispatchResult {
 }
 
 export interface DaemonHub {
-  /** Register the connected daemon conn. Replaces any prior conn (single daemon). */
-  register(conn: DaemonConn): void
-  /** Drop the conn if it is the current one (no-op for a stale conn). */
-  unregister(conn: DaemonConn): void
-  /** True when a daemon is currently connected. */
-  hasDaemon(): boolean
+  /** Register `userId`'s daemon conn. Replaces any prior conn for that user. */
+  register(userId: string, conn: DaemonConn): void
   /**
-   * Dispatch one turn: send agent:run, forward each trace:batch event to
-   * onEvent, resolve on turn:end. Rejects if no daemon is connected.
+   * Drop `userId`'s conn and fail any of that user's in-flight turns. Pass the
+   * `conn` to make a stale socket's close a no-op: if the user has since
+   * reconnected (a newer conn is registered), unregistering the old one must not
+   * drop the replacement. Omit `conn` to force-drop whatever is registered.
    */
-  dispatch(turnId: string, req: DispatchRequest, onEvent: (e: MappedEvent) => void): Promise<DispatchResult>
+  unregister(userId: string, conn?: DaemonConn): void
+  /** True when `userId` currently has a daemon connected. */
+  hasDaemon(userId: string): boolean
+  /**
+   * Dispatch one turn to `userId`'s daemon: send agent:run, forward each
+   * trace:batch event to onEvent, resolve on turn:end. Rejects if that user has
+   * no daemon connected.
+   */
+  dispatch(userId: string, turnId: string, req: DispatchRequest, onEvent: (e: MappedEvent) => void): Promise<DispatchResult>
   /** Route an inbound daemon→engine message into the hub (server wires this). */
   handleMessage(msg: DaemonToEngineMessage): void
 }
 
-/** Internal per-turn correlation state. */
+/** Internal per-turn correlation state. `userId` lets unregister fail only that user's turns. */
 interface Pending {
+  userId: string
   onEvent: (e: MappedEvent) => void
   resolve: (r: DispatchResult) => void
   reject: (err: Error) => void
 }
 
 export function daemonHub(): DaemonHub {
-  let conn: DaemonConn | undefined
+  // userId -> that user's connected daemon conn.
+  const conns = new Map<string, DaemonConn>()
+  // turnId -> the in-flight dispatch awaiting the daemon's reply.
   const pending = new Map<string, Pending>()
 
-  const failAll = (err: Error) => {
-    for (const [, p] of pending) p.reject(err)
-    pending.clear()
+  // Fail (and drop) every in-flight turn belonging to `userId`.
+  const failUser = (userId: string, err: Error) => {
+    for (const [turnId, p] of pending) {
+      if (p.userId === userId) {
+        pending.delete(turnId)
+        p.reject(err)
+      }
+    }
   }
 
   return {
-    register(c: DaemonConn): void {
-      conn = c
+    register(userId: string, conn: DaemonConn): void {
+      conns.set(userId, conn)
     },
-    unregister(c: DaemonConn): void {
-      // Only drop if it is the current conn; a stale conn closing is a no-op.
-      if (conn === c) {
-        conn = undefined
-        // In-flight turns can never complete without a daemon — fail them.
-        failAll(new Error('daemon disconnected'))
-      }
+    unregister(userId: string, conn?: DaemonConn): void {
+      const current = conns.get(userId)
+      if (current === undefined) return
+      // A stale socket closing after the user reconnected must not drop the
+      // replacement: only unregister when no conn is given OR it is the current one.
+      if (conn !== undefined && conn !== current) return
+      conns.delete(userId)
+      // In-flight turns for this user can never complete without their daemon — fail them.
+      failUser(userId, new Error('daemon disconnected'))
     },
-    hasDaemon(): boolean {
-      return conn !== undefined
+    hasDaemon(userId: string): boolean {
+      return conns.has(userId)
     },
-    dispatch(turnId: string, req: DispatchRequest, onEvent: (e: MappedEvent) => void): Promise<DispatchResult> {
-      const current = conn
-      if (!current) {
+    dispatch(userId: string, turnId: string, req: DispatchRequest, onEvent: (e: MappedEvent) => void): Promise<DispatchResult> {
+      const conn = conns.get(userId)
+      if (!conn) {
         return Promise.reject(new Error('no daemon connected'))
       }
       return new Promise<DispatchResult>((resolve, reject) => {
-        pending.set(turnId, { onEvent, resolve, reject })
+        pending.set(turnId, { userId, onEvent, resolve, reject })
         const run: AgentRunMessage = {
           type: 'agent:run',
           turnId,
@@ -97,7 +114,7 @@ export function daemonHub(): DaemonHub {
           ...(req.model !== undefined ? { model: req.model } : {}),
         }
         try {
-          current.send(run)
+          conn.send(run)
         } catch (err) {
           pending.delete(turnId)
           reject(err instanceof Error ? err : new Error(String(err)))

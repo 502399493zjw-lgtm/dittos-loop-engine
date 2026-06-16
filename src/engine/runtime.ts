@@ -37,7 +37,16 @@ export async function runFlow(flow: Flow, deps: RunDeps): Promise<{ status: RunS
     let parsed: string | Record<string, unknown>
     let cost = 0
     try {
-      const res = await executor.run({ agentId, prompt, model: opts.model, schema: opts.schema })
+      const res = await executor.run({
+        agentId,
+        prompt,
+        model: opts.model,
+        schema: opts.schema,
+        // Owner routing (spec §1): in daemon-mode the run's agent() calls must
+        // reach THIS user's linked daemon. Forwarded only when the run is owned;
+        // the in-process claude executor ignores it.
+        ...(deps.ownerId !== undefined ? { ownerId: deps.ownerId } : {}),
+      })
       emit({ type: 'agent_done', runId, nodeId, status: 'ok', result: res.text, cost: res.cost, durationMs: now() - start, ts: now() })
       cost = res.cost ?? 0
       if (opts.schema) { try { parsed = JSON.parse(res.text) as Record<string, unknown> } catch { parsed = res.text } }

@@ -32,6 +32,18 @@ describe('runFlow', () => {
     expect(ex.calls[0]?.agentId).toBe('codex')
   })
 
+  it('threads the run owner into every agent() executor req (daemon-mode owner routing)', async () => {
+    const { ex, deps } = harness()
+    await runFlow(async (api) => { await api.agent('scan'); await api.agent('sum') }, { ...deps, ownerId: 'owner-1' })
+    expect(ex.calls.map((c) => c.ownerId)).toEqual(['owner-1', 'owner-1'])
+  })
+
+  it('omits ownerId from the executor req when the run has no owner (in-process path)', async () => {
+    const { ex, deps } = harness()
+    await runFlow(async (api) => { await api.agent('scan') }, deps)
+    expect(ex.calls[0]?.ownerId).toBeUndefined()
+  })
+
   it('a thrown error → run_done failed, error surfaced (not swallowed)', async () => {
     const { events, deps } = harness()
     const out = await runFlow(async () => { throw new Error('boom') }, deps)

@@ -10,28 +10,30 @@ function fakeConn(sent: EngineToDaemonMessage[]): DaemonConn {
   return { send: (msg) => sent.push(msg) }
 }
 
-describe('daemonHub', () => {
-  it('hasDaemon flips on register and back off on unregister', () => {
+describe('daemonHub — keyed by userId', () => {
+  it('hasDaemon flips on register and back off on unregister, per user', () => {
     const hub = daemonHub()
     const conn = fakeConn([])
-    expect(hub.hasDaemon()).toBe(false)
-    hub.register(conn)
-    expect(hub.hasDaemon()).toBe(true)
-    hub.unregister(conn)
-    expect(hub.hasDaemon()).toBe(false)
+    expect(hub.hasDaemon('u1')).toBe(false)
+    hub.register('u1', conn)
+    expect(hub.hasDaemon('u1')).toBe(true)
+    // Another user is unaffected.
+    expect(hub.hasDaemon('u2')).toBe(false)
+    hub.unregister('u1')
+    expect(hub.hasDaemon('u1')).toBe(false)
   })
 
   it('dispatch sends agent:run, forwards trace:batch events, resolves on turn:end', async () => {
     const hub = daemonHub()
     const sent: EngineToDaemonMessage[] = []
-    hub.register(fakeConn(sent))
+    hub.register('u1', fakeConn(sent))
 
     const seen: MappedEvent[] = []
     const events: MappedEvent[] = [
       { kind: 'thinking', payload: { content: 'hmm' }, severity: 'info' },
       { kind: 'text', payload: { content: 'hi', message_id: 'm1' }, severity: 'info' },
     ]
-    const p = hub.dispatch('t1', { prompt: 'say hi', model: 'opus' }, (e) => seen.push(e))
+    const p = hub.dispatch('u1', 't1', { prompt: 'say hi', model: 'opus' }, (e) => seen.push(e))
 
     // The agent:run was sent with the turnId + prompt + model.
     expect(sent).toEqual<EngineToDaemonMessage[]>([
@@ -52,11 +54,11 @@ describe('daemonHub', () => {
 
   it('correlates by turnId across two concurrent dispatches', async () => {
     const hub = daemonHub()
-    hub.register(fakeConn([]))
+    hub.register('u1', fakeConn([]))
     const seenA: MappedEvent[] = []
     const seenB: MappedEvent[] = []
-    const pa = hub.dispatch('a', { prompt: 'A' }, (e) => seenA.push(e))
-    const pb = hub.dispatch('b', { prompt: 'B' }, (e) => seenB.push(e))
+    const pa = hub.dispatch('u1', 'a', { prompt: 'A' }, (e) => seenA.push(e))
+    const pb = hub.dispatch('u1', 'b', { prompt: 'B' }, (e) => seenB.push(e))
 
     hub.handleMessage({ type: 'trace:batch', turnId: 'b', events: [{ kind: 'text', payload: { content: 'B-evt' }, severity: 'info' }] })
     hub.handleMessage({ type: 'trace:batch', turnId: 'a', events: [{ kind: 'text', payload: { content: 'A-evt' }, severity: 'info' }] })
@@ -71,31 +73,66 @@ describe('daemonHub', () => {
 
   it('turn:end status=failed resolves with isError + errorText', async () => {
     const hub = daemonHub()
-    hub.register(fakeConn([]))
-    const p = hub.dispatch('t1', { prompt: 'x' }, () => {})
+    hub.register('u1', fakeConn([]))
+    const p = hub.dispatch('u1', 't1', { prompt: 'x' }, () => {})
     hub.handleMessage({ type: 'turn:end', turnId: 't1', status: 'failed', finalText: '', error: 'boom' })
     const r = await p
     expect(r.isError).toBe(true)
     expect(r.errorText).toBe('boom')
   })
 
-  it('dispatch rejects when no daemon is connected', async () => {
+  it('dispatch rejects when that user has no daemon connected', async () => {
     const hub = daemonHub()
-    await expect(hub.dispatch('t1', { prompt: 'x' }, () => {})).rejects.toThrow(/no daemon/)
+    await expect(hub.dispatch('u1', 't1', { prompt: 'x' }, () => {})).rejects.toThrow(/no daemon/)
   })
 
-  it('unregister fails any in-flight dispatch', async () => {
+  it('routes a turn to the right user and never to another user', async () => {
     const hub = daemonHub()
-    const conn = fakeConn([])
-    hub.register(conn)
-    const p = hub.dispatch('t1', { prompt: 'x' }, () => {})
-    hub.unregister(conn)
+    const sentA: EngineToDaemonMessage[] = []
+    const sentB: EngineToDaemonMessage[] = []
+    hub.register('alice', fakeConn(sentA))
+    hub.register('bob', fakeConn(sentB))
+
+    const p = hub.dispatch('alice', 't1', { prompt: 'for alice' }, () => {})
+    // Only alice's conn received the agent:run.
+    expect(sentA).toEqual<EngineToDaemonMessage[]>([{ type: 'agent:run', turnId: 't1', prompt: 'for alice' }])
+    expect(sentB).toEqual([])
+
+    hub.handleMessage({ type: 'turn:end', turnId: 't1', status: 'completed', finalText: 'done' })
+    expect((await p).finalText).toBe('done')
+
+    // bob has no daemon for HIS dispatch even though alice does.
+    hub.unregister('bob')
+    await expect(hub.dispatch('bob', 't2', { prompt: 'x' }, () => {})).rejects.toThrow(/no daemon/)
+  })
+
+  it('unregister fails any in-flight dispatch for that user', async () => {
+    const hub = daemonHub()
+    hub.register('u1', fakeConn([]))
+    const p = hub.dispatch('u1', 't1', { prompt: 'x' }, () => {})
+    hub.unregister('u1')
     await expect(p).rejects.toThrow(/disconnected/)
+  })
+
+  it('a stale conn unregister does not drop a reconnected daemon for the same user', () => {
+    const hub = daemonHub()
+    const first = fakeConn([])
+    const second = fakeConn([])
+    hub.register('u1', first)
+    // User reconnects with a new conn (replaces the first).
+    hub.register('u1', second)
+    expect(hub.hasDaemon('u1')).toBe(true)
+    // The OLD socket closes and unregisters with its own (stale) conn — must be a no-op.
+    hub.unregister('u1', first)
+    expect(hub.hasDaemon('u1')).toBe(true)
+    // The current conn unregistering does drop it.
+    hub.unregister('u1', second)
+    expect(hub.hasDaemon('u1')).toBe(false)
   })
 
   it('ignores trace:batch / turn:end for an unknown turnId (no throw)', () => {
     const hub = daemonHub()
-    hub.register(fakeConn([]))
+    hub.register('u1', fakeConn([]))
     expect(() => hub.handleMessage({ type: 'trace:batch', turnId: 'ghost', events: [] })).not.toThrow()
     expect(() => hub.handleMessage({ type: 'turn:end', turnId: 'ghost', status: 'completed', finalText: '' })).not.toThrow()
   })

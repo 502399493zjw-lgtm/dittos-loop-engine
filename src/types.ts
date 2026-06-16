@@ -29,6 +29,12 @@ export interface ExecutorRequest {
   prompt: string
   model?: string
   schema?: Record<string, unknown>
+  /**
+   * The user whose linked local daemon should run this (daemon-mode owner
+   * routing, spec §1). The daemonExecutor dispatches to this user's conn; unset
+   * in the in-process claude path (ignored there).
+   */
+  ownerId?: string
 }
 export interface ExecutorResult {
   text: string
@@ -79,6 +85,12 @@ export interface RunDeps {
   runId: string
   executor: Executor
   defaultAgent: string
+  /**
+   * The user who owns this run; threaded into every agent() executor req so
+   * daemon-mode routes the run to THIS user's linked local daemon (spec §1).
+   * Unset for unowned/dev runs — the in-process claude executor ignores it.
+   */
+  ownerId?: string
   args?: unknown
   /** per-run cost cap in USD; undefined = no cap */
   budgetUsd?: number

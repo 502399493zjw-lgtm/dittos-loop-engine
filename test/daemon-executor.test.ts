@@ -43,11 +43,11 @@ describe('daemonExecutor', () => {
       { kind: 'text', payload: { content: 'hello', message_id: 'm1' }, severity: 'info' },
     ]
     const { conn, sent } = autoReplyConn(hub, { events, finalText: 'hello', usage: { output_tokens: 2 } })
-    hub.register(conn)
+    hub.register('u1', conn)
     const ex = daemonExecutor(hub)
 
     const seen: MappedEvent[] = []
-    const r = await ex.run({ prompt: 'hi', model: 'opus' }, (e) => seen.push(e))
+    const r = await ex.run({ prompt: 'hi', model: 'opus', ownerId: 'u1' }, (e) => seen.push(e))
     expect(seen).toEqual(events)
     expect(r.finalText).toBe('hello')
     expect(r.usage).toEqual({ output_tokens: 2 })
@@ -66,10 +66,10 @@ describe('daemonExecutor', () => {
       finalText: 'done',
       usage: { cost: 0.05 },
     })
-    hub.register(conn)
+    hub.register('u1', conn)
     const ex = daemonExecutor(hub)
 
-    const r = await ex.run({ agentId: 'claude', prompt: 'do it' })
+    const r = await ex.run({ agentId: 'claude', prompt: 'do it', ownerId: 'u1' })
     expect(r.text).toBe('done')
     expect(r.cost).toBe(0.05)
   })
@@ -77,17 +77,23 @@ describe('daemonExecutor', () => {
   it('surfaces a failed turn as isError', async () => {
     const hub = daemonHub()
     const { conn } = autoReplyConn(hub, { events: [], finalText: 'boom', fail: true })
-    hub.register(conn)
+    hub.register('u1', conn)
     const ex = daemonExecutor(hub)
-    const r = await ex.run({ prompt: 'x' }, () => {})
+    const r = await ex.run({ prompt: 'x', ownerId: 'u1' }, () => {})
     expect(r.isError).toBe(true)
     expect(r.errorText).toBe('boom')
   })
 
-  it('rejects with a clear error when no daemon is connected', async () => {
+  it('rejects with a clear error when the owner has no daemon connected', async () => {
     const hub = daemonHub()
     const ex = daemonExecutor(hub)
-    await expect(ex.run({ prompt: 'x' }, () => {})).rejects.toThrow(/no daemon/)
-    await expect(ex.run({ agentId: 'claude', prompt: 'x' })).rejects.toThrow(/no daemon/)
+    await expect(ex.run({ prompt: 'x', ownerId: 'u1' }, () => {})).rejects.toThrow(/no daemon/)
+    await expect(ex.run({ agentId: 'claude', prompt: 'x', ownerId: 'u1' })).rejects.toThrow(/no daemon/)
+  })
+
+  it('rejects with a clear error when the request has no owner', async () => {
+    const hub = daemonHub()
+    const ex = daemonExecutor(hub)
+    await expect(ex.run({ prompt: 'x' }, () => {})).rejects.toThrow(/no owner/)
   })
 })

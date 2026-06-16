@@ -1,6 +1,6 @@
 import http from 'node:http'
 import { WebSocketServer } from 'ws'
-import { randomUUID, createHash, timingSafeEqual } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { runFlow } from './engine/runtime'
 import { jsonStore } from './store/jsonStore'
 import type { EngineEvent, Executor, Flow, ApprovalRequest, ApprovalResult } from './types'
@@ -13,6 +13,7 @@ import type { TurnStore, TraceStore } from './chat/types'
 import type { StreamExecutor } from './chat/streamExecutor'
 import { respondToMessage } from './chat/respond'
 import type { DaemonHub, DaemonConn } from './daemon/daemonHub'
+import type { DaemonTokenStore } from './daemon/daemonTokenStore'
 import { parseDaemonMessage } from './daemon/protocol'
 import type { GithubOAuth } from './auth/github'
 import type { UserStore, TokenStore } from './auth/types'
@@ -53,18 +54,21 @@ export interface ServerConfig {
    */
   makeRunner?: (emit: (e: EngineEvent) => void, awaitApproval: (req: ApprovalRequest) => Promise<ApprovalResult>, sessionBus?: SessionBus) => LoopRunner
   /**
-   * Daemon link (spec §2-§3). When set, the `/daemon/ws` endpoint is mounted: a
-   * local daemon connects with `?token=<t>`, the engine hashes it and compares
-   * (timing-safe) against `tokenHash`, closing on mismatch. The accepted conn is
-   * registered into `hub`; inbound daemon messages (turn:start/trace:batch/turn:end)
-   * are routed to the hub. `daemonExecutor(hub)` (wired as the chat streamExecutor
-   * and/or loop executor in serve.ts) dispatches turns over this same hub. When
-   * unset, no daemon surface exists (local-dev path with the in-process executors).
+   * Daemon link (spec §1-§2). When set, the `/daemon/ws` endpoint is mounted: a
+   * local daemon connects with `?token=<t>`; the engine resolves the token via
+   * `daemonTokenStore` to a userId and registers the conn into `hub` KEYED BY
+   * userId (closing on an unknown token). Inbound daemon messages
+   * (turn:start/trace:batch/turn:end) are routed to the hub. The auth-gated
+   * `POST /daemon/tokens` (issue for the authed user) + `GET /daemon/status`
+   * (is this user's daemon online) ride on the same store/hub. `daemonExecutor(hub)`
+   * (wired as the chat streamExecutor and/or loop executor in serve.ts) dispatches
+   * turns over this same hub, routed by the turn's ownerId. When unset, no daemon
+   * surface exists (local-dev path with the in-process executors).
    */
   daemon?: {
     hub: DaemonHub
-    /** sha256 hex of the shared DAEMON_TOKEN; the connecting token is hashed the same way. */
-    tokenHash: string
+    /** Per-user daemon tokens: issue(userId) for /daemon/tokens, resolve(token)->userId at handshake. */
+    daemonTokenStore: DaemonTokenStore
   }
   /**
    * GitHub-OAuth bearer auth. When set, the /auth/* endpoints are mounted and
@@ -85,21 +89,6 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     req.on('data', (c) => (body += c))
     req.on('end', () => resolve(body))
   })
-}
-
-/**
- * Timing-safe compare of a connecting daemon token against the configured hash.
- * The engine stores sha256(DAEMON_TOKEN) as hex; the daemon connects with the
- * raw token, which we hash the same way and compare via timingSafeEqual over the
- * fixed-length hex digests (so an empty/short token never short-circuits).
- */
-function tokenMatches(token: string, expectedHash: string): boolean {
-  if (!token || !expectedHash) return false
-  const got = createHash('sha256').update(token).digest('hex')
-  const a = Buffer.from(got)
-  const b = Buffer.from(expectedHash)
-  if (a.length !== b.length) return false
-  return timingSafeEqual(a, b)
 }
 
 export function createServer(cfg: ServerConfig) {
@@ -187,7 +176,8 @@ export function createServer(cfg: ServerConfig) {
     path === '/sessions' || path.startsWith('/sessions/') ||
     path === '/projects' || path.startsWith('/projects/') ||
     path === '/channels' || path.startsWith('/channels/') ||
-    path === '/turns' || path.startsWith('/turns/')
+    path === '/turns' || path.startsWith('/turns/') ||
+    path === '/daemon/tokens' || path === '/daemon/status'
 
   const httpServer = http.createServer((req, res) => {
     const url = req.url ?? ''
@@ -471,6 +461,29 @@ export function createServer(cfg: ServerConfig) {
       return
     }
 
+    // ---- daemon link: per-user token issue + status (auth-gated, spec §1) ----
+    // POST /daemon/tokens → { token }: mint a daemon token for the authed user.
+    // The token is shown once; the user runs their local daemon with it so
+    // /daemon/ws can resolve it back to this userId. A daemon token is meaningless
+    // without an owner, so these require auth (401 when no userId is resolved).
+    if (method === 'POST' && url.split('?')[0] === '/daemon/tokens') {
+      if (!cfg.daemon) { res.writeHead(500).end('no daemon surface'); return }
+      if (userId === undefined) { res.writeHead(401).end(); return }
+      void cfg.daemon.daemonTokenStore.issue(userId).then((token) => {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ token }))
+      })
+      return
+    }
+
+    // GET /daemon/status → { online }: is the authed user's daemon connected?
+    if (method === 'GET' && url.split('?')[0] === '/daemon/status') {
+      if (!cfg.daemon) { res.writeHead(500).end('no daemon surface'); return }
+      if (userId === undefined) { res.writeHead(401).end(); return }
+      const online = cfg.daemon.hub.hasDaemon(userId)
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ online }))
+      return
+    }
+
     // ---- auth: GitHub OAuth bearer (only mounted when configured) ----
     if (cfg.auth) {
       const { github, userStore, tokenStore, sessionSecret, appBaseUrl } = cfg.auth
@@ -527,11 +540,12 @@ export function createServer(cfg: ServerConfig) {
     }
   })
 
-  // Daemon link auth (spec §2) is enforced at the WS HANDSHAKE: a `/daemon/ws`
-  // upgrade is rejected (HTTP 401, never upgraded) unless the daemon surface is
-  // configured AND the `?token` hashes to the configured tokenHash (timing-safe).
-  // All non-daemon WS paths pass through untouched (chat + run streams). Rejecting
-  // pre-upgrade means a bad daemon never observes an open socket.
+  // Daemon link auth (spec §1) is enforced at the WS HANDSHAKE for the cheap
+  // checks (surface configured + a `?token` present), then the token is resolved
+  // to a userId in 'connection' (the resolve is async, so it can't run inside the
+  // sync verifyClient). An upgrade with no daemon surface or no token is rejected
+  // pre-upgrade; a present-but-unknown token is closed right after connect. All
+  // non-daemon WS paths pass through untouched (chat + run streams).
   const isDaemonPath = (u: string) => /^\/daemon\/ws(\?|$)/.test(u)
   const wss = new WebSocketServer({
     server: httpServer,
@@ -540,24 +554,30 @@ export function createServer(cfg: ServerConfig) {
       if (!isDaemonPath(u)) return true // chat/run WS: handled in 'connection'
       if (!cfg.daemon) return false
       const token = new URL(u, 'http://x').searchParams.get('token') ?? ''
-      return tokenMatches(token, cfg.daemon.tokenHash)
+      return token.length > 0 // resolve token -> userId in 'connection' below
     },
   })
   wss.on('connection', (ws, req) => {
     const reqUrl = req.url ?? ''
 
-    // Daemon link (spec §2-§3): token was already verified at handshake. Adapt the
-    // WS to a DaemonConn, register it into the hub, and route inbound daemon→engine
-    // messages (turn:start/trace:batch/turn:end) to the hub. Drop on close.
+    // Daemon link (spec §1): resolve `?token=` to a userId via daemonTokenStore,
+    // then register the conn into the hub KEYED BY that userId. Unknown token →
+    // close (never registered). Adapt the WS to a DaemonConn and route inbound
+    // daemon→engine messages (turn:start/trace:batch/turn:end) to the hub.
     if (isDaemonPath(reqUrl) && cfg.daemon) {
       const hub = cfg.daemon.hub
-      const conn: DaemonConn = { send: (msg) => ws.send(JSON.stringify(msg)) }
-      hub.register(conn)
-      ws.on('message', (data) => {
-        const msg = parseDaemonMessage(data as Buffer)
-        if (msg) hub.handleMessage(msg)
+      const token = new URL(reqUrl, 'http://x').searchParams.get('token') ?? ''
+      void cfg.daemon.daemonTokenStore.resolve(token).then((userId) => {
+        if (!userId) { ws.close(); return }
+        const conn: DaemonConn = { send: (msg) => ws.send(JSON.stringify(msg)) }
+        hub.register(userId, conn)
+        ws.on('message', (data) => {
+          const msg = parseDaemonMessage(data as Buffer)
+          if (msg) hub.handleMessage(msg)
+        })
+        // Pass conn so a stale socket's close doesn't drop a reconnected daemon.
+        ws.on('close', () => hub.unregister(userId, conn))
       })
-      ws.on('close', () => hub.unregister(conn))
       return
     }
 

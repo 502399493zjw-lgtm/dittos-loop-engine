@@ -14,6 +14,12 @@ export interface MappedEvent {
 export interface StreamRequest {
   prompt: string
   model?: string
+  /**
+   * The user whose linked local daemon should run this turn (daemon-mode owner
+   * routing, spec §1). The daemonExecutor dispatches to this user's conn; unset
+   * in the in-process claude path (ignored there).
+   */
+  ownerId?: string
 }
 
 export interface StreamResult {

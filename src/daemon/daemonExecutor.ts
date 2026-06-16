@@ -44,12 +44,19 @@ export function daemonExecutor(hub: DaemonHub): DaemonExecutor {
       req: StreamRequest | ExecutorRequest,
       onEvent?: (e: MappedEvent) => void,
     ): Promise<StreamResult & ExecutorResult> {
-      if (!hub.hasDaemon()) {
-        throw new Error('no daemon connected: cannot run agent (DAEMON_MODE requires a linked local daemon)')
+      // Owner routing (spec §1): the turn goes to the requesting user's linked
+      // daemon. No ownerId means we can't route it to anyone.
+      const ownerId = req.ownerId
+      if (!ownerId) {
+        throw new Error('no owner for run: cannot route to a daemon (DAEMON_MODE requires req.ownerId)')
+      }
+      if (!hub.hasDaemon(ownerId)) {
+        throw new Error('no daemon connected: your local agent isn\'t connected (DAEMON_MODE requires a linked local daemon)')
       }
       const turnId = randomUUID()
       const sink = onEvent ?? (() => {})
       const result = await hub.dispatch(
+        ownerId,
         turnId,
         { prompt: req.prompt, ...(req.model !== undefined ? { model: req.model } : {}) },
         sink,

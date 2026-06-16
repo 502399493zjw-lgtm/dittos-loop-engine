@@ -81,6 +81,10 @@ export function loopRunner(deps: LoopRunnerDeps): LoopRunner {
         runId: randomUUID(),
         executor: deps.executor,
         defaultAgent: deps.defaultAgent,
+        // Owner routing (spec §1): the loop's runs go to the loop owner's linked
+        // daemon. Forwarded only when the loop is owned; unowned dev loops route
+        // to the in-process executor, which ignores it.
+        ...(spec.ownerId !== undefined ? { ownerId: spec.ownerId } : {}),
         args: { cursor: state.cursor },
         budgetUsd: spec.budgetUsd,
         memory,

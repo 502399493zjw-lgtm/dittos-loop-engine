@@ -133,7 +133,14 @@ export async function respondToMessage(deps: RespondDeps, args: RespondArgs): Pr
 
   let result
   try {
-    result = await streamExecutor.run({ prompt, ...(deps.model !== undefined ? { model: deps.model } : {}) }, onEvent)
+    result = await streamExecutor.run({
+      prompt,
+      ...(deps.model !== undefined ? { model: deps.model } : {}),
+      // Owner routing (spec §1): in daemon-mode the turn must reach THIS user's
+      // linked daemon. Forwarded only when known (auth-gated); the in-process
+      // claude executor ignores it.
+      ...(ownerId !== undefined ? { ownerId } : {}),
+    }, onEvent)
     await chain // drain any still-pending per-event work
   } catch (err) {
     await chain.catch(() => {})

@@ -5,7 +5,11 @@ import { jsonTurnStore } from '../src/chat/turnStore'
 import { jsonTraceStore } from '../src/chat/traceStore'
 import { jsonSessionStore } from '../src/session/jsonSessionStore'
 import { fakeStreamExecutor } from '../src/chat/streamExecutor'
-import type { MappedEvent } from '../src/chat/streamExecutor'
+import { daemonHub } from '../src/daemon/daemonHub'
+import { daemonExecutor } from '../src/daemon/daemonExecutor'
+import type { MappedEvent, StreamExecutor } from '../src/chat/streamExecutor'
+import type { DaemonConn } from '../src/daemon/daemonHub'
+import type { AgentRunMessage, EngineToDaemonMessage } from '../src/daemon/protocol'
 
 const clock = (start = 1000, step = 1000) => {
   let t = start - step
@@ -22,7 +26,7 @@ const recorder = () => {
   return { events, emit, typesOf, first, all }
 }
 
-async function makeDeps(dir: string, ex: ReturnType<typeof fakeStreamExecutor>) {
+async function makeDeps(dir: string, ex: StreamExecutor) {
   const now = clock()
   return {
     sessionStore: jsonSessionStore(join(dir, 'sess'), { now }),
@@ -134,6 +138,22 @@ describe('respondToMessage', () => {
     // the prompt assembled from history was fed to the executor
     expect(ex.calls.length).toBe(1)
     expect(ex.calls[0]!.prompt).toContain('hi agent')
+    // the channel owner is forwarded so daemon-mode routes the turn to A's daemon
+    expect(ex.calls[0]!.ownerId).toBe('A')
+  })
+
+  it('omits ownerId from the executor req when the channel is unowned (dev / in-process path)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resp-'))
+    const ex = fakeStreamExecutor({ events: [], finalText: 'ok' })
+    const deps = await makeDeps(dir, ex)
+    const rec = recorder()
+    const session = await deps.sessionStore.createSession(undefined, {})
+    const userMsg = await deps.sessionStore.appendMessage(session.id, {
+      sender_type: 'user', type: 'text', content: { text: 'hi' },
+    })
+    await respondToMessage({ ...deps, emit: rec.emit }, { channelId: session.id, userMessage: userMsg })
+    expect(ex.calls.length).toBe(1)
+    expect(ex.calls[0]!.ownerId).toBeUndefined()
   })
 
   it('marks the turn failed and emits turn:update(failed) with error on an isError run', async () => {
@@ -198,5 +218,82 @@ describe('respondToMessage', () => {
     expect(streamingChunks).toEqual(['Hel', 'lo'])
     const nm = rec.first('new_message')!.payload
     expect(nm.message.content.text).toBe('Hello')
+  })
+})
+
+// A chat turn over the REAL daemonExecutor proves owner routing through the full
+// respond turn lifecycle: A's turn runs on A's daemon, never reaches B's, and a
+// turn for an owner with no daemon fails clearly (turn:update failed).
+describe('respondToMessage — owner routing via daemonExecutor', () => {
+  // A fake daemon conn that records the agent:run it received and auto-replies
+  // start → batch → end so dispatch resolves without a real WS.
+  function autoReplyConn(
+    hub: ReturnType<typeof daemonHub>,
+    reply: { finalText: string; events?: MappedEvent[] },
+  ): { conn: DaemonConn; sent: EngineToDaemonMessage[] } {
+    const sent: EngineToDaemonMessage[] = []
+    const conn: DaemonConn = {
+      send: (msg) => {
+        sent.push(msg)
+        if (msg.type !== 'agent:run') return
+        const run = msg as AgentRunMessage
+        queueMicrotask(() => {
+          hub.handleMessage({ type: 'turn:start', turnId: run.turnId })
+          hub.handleMessage({ type: 'trace:batch', turnId: run.turnId, events: reply.events ?? [] })
+          hub.handleMessage({ type: 'turn:end', turnId: run.turnId, status: 'completed', finalText: reply.finalText })
+        })
+      },
+    }
+    return { conn, sent }
+  }
+
+  it("runs A's turn on A's daemon and never touches B's daemon", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resp-'))
+    const hub = daemonHub()
+    const a = autoReplyConn(hub, {
+      finalText: 'from A daemon',
+      events: [{ kind: 'text', payload: { content: 'from A daemon' }, severity: 'info' }],
+    })
+    const b = autoReplyConn(hub, { finalText: 'from B daemon' })
+    hub.register('A', a.conn)
+    hub.register('B', b.conn)
+
+    const deps = await makeDeps(dir, daemonExecutor(hub))
+    const rec = recorder()
+    const session = await deps.sessionStore.createSession(undefined, { ownerId: 'A' })
+    const userMsg = await deps.sessionStore.appendMessage(session.id, {
+      sender_type: 'user', type: 'text', content: { text: 'hi' },
+    })
+
+    const result = await respondToMessage({ ...deps, emit: rec.emit }, { channelId: session.id, ownerId: 'A', userMessage: userMsg })
+
+    // A's daemon got the agent:run; B's daemon got nothing.
+    const aRun = a.sent.find((m) => m.type === 'agent:run') as AgentRunMessage | undefined
+    expect(aRun).toBeTruthy()
+    expect(b.sent).toEqual([])
+    // The turn completed via A's daemon's reply.
+    expect(result.turn.status).toBe('completed')
+    expect(result.message!.content.text).toBe('from A daemon')
+  })
+
+  it('fails the turn clearly (turn:update failed) when the owner has no daemon', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resp-'))
+    const hub = daemonHub() // nobody registered
+    const deps = await makeDeps(dir, daemonExecutor(hub))
+    const rec = recorder()
+    const session = await deps.sessionStore.createSession(undefined, { ownerId: 'A' })
+    const userMsg = await deps.sessionStore.appendMessage(session.id, {
+      sender_type: 'user', type: 'text', content: { text: 'hi' },
+    })
+
+    const result = await respondToMessage({ ...deps, emit: rec.emit }, { channelId: session.id, ownerId: 'A', userMessage: userMsg })
+
+    const failed = rec.events.find((e) => e.type === 'turn:update' && e.payload.status === 'failed')
+    expect(failed).toBeTruthy()
+    expect(failed!.payload.error_message).toMatch(/no daemon|not connected/)
+    expect(result.turn.status).toBe('failed')
+    expect(result.message).toBeUndefined()
+    // no agent message persisted on failure
+    expect(rec.first('new_message')).toBeUndefined()
   })
 })

@@ -136,6 +136,27 @@ describe('loopRunner.tick — platform contract', () => {
     expect(events.some((e) => e.type === 'budget_exceeded')).toBe(true)
   })
 
+  it('threads the loop spec ownerId into the run so agent() calls route to that owner (daemon-mode)', async () => {
+    const flow: Flow = async (api) => { await api.agent('a'); await api.agent('b'); return 'ok' }
+    const { store, runner, ex } = harness({ demo: flow })
+    await store.upsert(spec({ ownerId: 'owner-7' }))
+
+    await runner.tick('L1')
+
+    expect(ex.calls.length).toBe(2)
+    expect(ex.calls.map((c) => c.ownerId)).toEqual(['owner-7', 'owner-7'])
+  })
+
+  it('an unowned loop forwards no ownerId (dev / in-process path unaffected)', async () => {
+    const flow: Flow = async (api) => { await api.agent('a'); return 'ok' }
+    const { store, runner, ex } = harness({ demo: flow })
+    await store.upsert(spec())
+
+    await runner.tick('L1')
+
+    expect(ex.calls[0]?.ownerId).toBeUndefined()
+  })
+
   it('paused loop is a no-op (flow never runs)', async () => {
     let ran = false
     const flow: Flow = async () => { ran = true; return 'ok' }
