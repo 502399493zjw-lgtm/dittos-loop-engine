@@ -42,6 +42,7 @@ export function createServer(cfg: { executor: Executor; defaultAgent: string; fl
     const m = /\/runs\/([^/]+)\/events/.exec(req.url ?? '')
     if (!m) { ws.close(); return }
     const runId = m[1]
+    if (!runId) { ws.close(); return }
     for (const e of buffer.get(runId) ?? []) ws.send(JSON.stringify(e)) // replay so late joiners catch up
     const fn = (e: EngineEvent) => ws.send(JSON.stringify(e))
     ;(subs.get(runId) ?? subs.set(runId, new Set()).get(runId)!).add(fn)

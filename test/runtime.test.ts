@@ -29,7 +29,7 @@ describe('runFlow', () => {
   it('agent({agent}) overrides the default agent', async () => {
     const { ex, deps } = harness()
     await runFlow(async (api) => { await api.agent('scan', { agent: 'codex' }) }, deps)
-    expect(ex.calls[0].agentId).toBe('codex')
+    expect(ex.calls[0]?.agentId).toBe('codex')
   })
 
   it('a thrown error → run_done failed, error surfaced (not swallowed)', async () => {

@@ -9,7 +9,7 @@ describe('server', () => {
     const srv = createServer({ executor: fakeExecutor(), defaultAgent: 'claude', flows: { demo: flow }, storeDir: undefined })
     const { port } = await srv.listen(0)
     const res = await fetch(`http://localhost:${port}/runs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ flow: 'demo', args: {} }) })
-    const { runId } = await res.json()
+    const { runId } = (await res.json()) as { runId: string }
     const got: string[] = await new Promise((resolve) => {
       const ws = new WebSocket(`ws://localhost:${port}/runs/${runId}/events`)
       const types: string[] = []
