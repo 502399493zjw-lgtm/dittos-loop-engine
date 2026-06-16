@@ -6,6 +6,8 @@ export interface LoopSpec {
     | { kind: 'cron'; expr: string }
   budgetUsd?: number           // per-run cost cap; undefined = no cap
   maxConsecutiveFailures?: number  // default 3
+  /** Which project the loop belongs to; its runs' sessions open under it. */
+  projectId?: string
 }
 export interface LoopState {
   cursor: unknown              // opaque; advanced by the flow via api.commit({cursor})

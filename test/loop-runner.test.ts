@@ -3,7 +3,9 @@ import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import 
 import { loopRunner } from '../src/loop/loopRunner'
 import { jsonLoopStore } from '../src/loop/jsonLoopStore'
 import { fakeExecutor } from '../src/executor/fake'
+import { fakeSessionBus } from '../src/loop/sessionBus'
 import type { LoopSpec } from '../src/loop/types'
+import type { SessionBus } from '../src/loop/sessionBus'
 import type { EngineEvent, Flow } from '../src/types'
 
 const spec = (over: Partial<LoopSpec> = {}): LoopSpec => ({
@@ -12,7 +14,7 @@ const spec = (over: Partial<LoopSpec> = {}): LoopSpec => ({
 
 interface Captured { kind: 'paused'; reason: 'failures' | 'budget'; detail: string; loopId: string }
 
-function harness(flows: Record<string, Flow>, specOver: Partial<LoopSpec> = {}) {
+function harness(flows: Record<string, Flow>, opts: { sessionBus?: SessionBus } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'lr-'))
   const store = jsonLoopStore(dir)
   const events: EngineEvent[] = []
@@ -26,8 +28,9 @@ function harness(flows: Record<string, Flow>, specOver: Partial<LoopSpec> = {}) 
     notify: (loopId, ev) => notified.push({ ...ev, loopId }),
     defaultAgent: 'claude',
     memoryDir: dir,
+    sessionBus: opts.sessionBus,
   })
-  return { dir, store, events, notified, ex, runner, specOver }
+  return { dir, store, events, notified, ex, runner }
 }
 
 describe('loopRunner.tick — platform contract', () => {
@@ -172,5 +175,26 @@ describe('loopRunner.tick — platform contract', () => {
     const { store, runner } = harness({})
     await store.upsert(spec({ flow: 'missing' }))
     await expect(runner.tick('L1')).rejects.toThrow(/missing/)
+  })
+
+  it('runs a loop inside a fresh session and mirrors narration', async () => {
+    const bus = fakeSessionBus()
+    const flow: Flow = async (api) => { api.log('working'); return 'done' }
+    const { store, runner } = harness({ f: flow }, { sessionBus: bus })
+    await store.upsert(spec({ id: 'L', flow: 'f', projectId: 'proj-1' }))
+
+    await runner.tick('L', { kind: 'manual' })
+
+    const created = bus.calls.find((c) => c.kind === 'create')
+    expect(created).toMatchObject({ kind: 'create', projectId: 'proj-1' })
+    const posts = bus.calls.filter((c) => c.kind === 'post').map((c) => (c as { text: string }).text)
+    expect(posts.some((t) => t.includes('你手动触发'))).toBe(true) // kickoff
+    expect(posts.some((t) => t.includes('working'))).toBe(true)    // mirrored log
+
+    // state still ratchets
+    const got = await store.get('L')
+    expect(got?.state.consecutiveFailures).toBe(0)
+    expect(got?.state.paused).toBe(false)
+    expect(got?.state.lastRunAt).toBeTypeOf('number')
   })
 })

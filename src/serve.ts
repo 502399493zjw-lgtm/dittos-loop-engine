@@ -17,6 +17,7 @@ import { claudeCliExecutor } from './executor/claudeCli'
 import { fakeExecutor } from './executor/fake'
 import { jsonLoopStore } from './loop/jsonLoopStore'
 import { loopRunner } from './loop/loopRunner'
+import { fakeSessionBus } from './loop/sessionBus'
 import type { Executor, Flow } from './types'
 import type { LoopStore } from './loop/types'
 
@@ -51,13 +52,17 @@ async function main(): Promise<void> {
   const executor = buildExecutor()
   const store = jsonLoopStore(process.env.LOOP_DATA_DIR || './.data/loops')
   const memoryDir = process.env.LOOP_MEMORY_DIR || './.data/memory'
+  // TODO: real agent-im SessionBus (follow-up) — loop runs open + mirror into a real
+  // scoped session under their project; for now the fake records the lifecycle in-memory.
+  const sessionBus = fakeSessionBus()
 
   const srv = createServer({
     executor,
     defaultAgent: 'claude',
     flows,
     store,
-    makeRunner: (emit, awaitApproval) => loopRunner({ store, executor, flows, emit, awaitApproval, notify: () => {}, defaultAgent: 'claude', memoryDir }),
+    sessionBus,
+    makeRunner: (emit, awaitApproval, sessionBus) => loopRunner({ store, executor, flows, emit, awaitApproval, sessionBus, notify: () => {}, defaultAgent: 'claude', memoryDir }),
   })
 
   await seedDemoLoop(store)

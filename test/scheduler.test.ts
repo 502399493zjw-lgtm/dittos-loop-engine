@@ -4,6 +4,7 @@ import { loopScheduler } from '../src/loop/scheduler'
 import { jsonLoopStore } from '../src/loop/jsonLoopStore'
 import type { LoopRunner } from '../src/loop/loopRunner'
 import type { LoopSpec, LoopStore } from '../src/loop/types'
+import type { TriggerCause } from '../src/loop/triggerReason'
 
 const spec = (over: Partial<LoopSpec> = {}): LoopSpec => ({
   id: 'L1', flow: 'demo', trigger: { kind: 'interval', everyMs: 1000 }, ...over,
@@ -144,6 +145,25 @@ describe('loopScheduler — interval ticking', () => {
     sched.stop()
 
     expect(runner.calls.filter((id) => id === 'CRON')).toHaveLength(0)
+  })
+
+  it('ticks a due loop with a schedule cause', async () => {
+    const store = freshStore()
+    await store.upsert(spec())
+    const causes: Array<TriggerCause | undefined> = []
+    const runner: LoopRunner = {
+      async tick(_loopId: string, cause?: TriggerCause) { causes.push(cause) },
+    }
+    let clock = 0
+    const sched = loopScheduler({ store, runner, tickMs: 100, now: () => clock })
+
+    sched.start()
+    clock = 1000
+    await vi.advanceTimersByTimeAsync(1000)
+    sched.stop()
+
+    expect(causes.length).toBeGreaterThanOrEqual(1)
+    expect(causes.every((c) => c?.kind === 'schedule')).toBe(true)
   })
 
   it('one loop throwing does not stop the scheduler from ticking others', async () => {

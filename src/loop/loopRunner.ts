@@ -2,8 +2,12 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { runFlow } from '../engine/runtime'
 import { memoryFile } from './memoryFile'
+import { describeTrigger } from './triggerReason'
+import { kickoffMessage } from './kickoff'
 import type { Executor, EngineEvent, Flow, ApprovalRequest, ApprovalResult } from '../types'
 import type { LoopStore, Notify } from './types'
+import type { SessionBus } from './sessionBus'
+import type { TriggerCause } from './triggerReason'
 
 export interface LoopRunnerDeps {
   store: LoopStore
@@ -16,13 +20,16 @@ export interface LoopRunnerDeps {
   memoryDir: string
   /** resolves an approval gate; forwarded into runFlow so loop-triggered runs honour human-in-the-loop gates */
   awaitApproval?: (req: ApprovalRequest) => Promise<ApprovalResult>
+  /** when set, each run opens a fresh chat session under the loop's project and
+   *  auto-mirrors its narration into it; when absent the runner behaves headlessly. */
+  sessionBus?: SessionBus
   /** injectable clock for deterministic tests */
   now?: () => number
 }
 
 export interface LoopRunner {
   /** Run one iteration of a loop and apply the platform contract. */
-  tick(loopId: string): Promise<void>
+  tick(loopId: string, cause?: TriggerCause): Promise<void>
 }
 
 /**
@@ -37,7 +44,7 @@ export function loopRunner(deps: LoopRunnerDeps): LoopRunner {
   const now = deps.now ?? Date.now
 
   return {
-    async tick(loopId: string): Promise<void> {
+    async tick(loopId: string, cause: TriggerCause = { kind: 'schedule' }): Promise<void> {
       const loaded = await deps.store.get(loopId)
       if (!loaded) throw new Error(`loop not found: ${loopId}`)
       const { spec, state } = loaded
@@ -48,11 +55,25 @@ export function loopRunner(deps: LoopRunnerDeps): LoopRunner {
 
       const memory = memoryFile(join(deps.memoryDir, `${loopId}.md`))
 
+      // When a session bus is wired, this run opens a fresh chat session under the
+      // loop's project and posts the global kickoff (with this firing's reason).
+      const bus = deps.sessionBus
+      let sessionId: string | undefined
+      if (bus) {
+        ;({ sessionId } = await bus.createSession(spec.projectId, { title: spec.id }))
+        await bus.postMessage(sessionId, kickoffMessage(describeTrigger(spec.trigger, cause)))
+      }
+
       // Sniff this run's events for a budget blowout so we can attribute the pause reason,
-      // while still forwarding every event to the real emit sink.
+      // while still forwarding every event to the real emit sink. When a session is open we
+      // also mirror the run's narration (log lines + final summary) into it.
       let budgetHit = false
       const emit = (e: EngineEvent) => {
         if (e.type === 'budget_exceeded') budgetHit = true
+        if (bus && sessionId) {
+          if (e.type === 'log') void bus.postMessage(sessionId, e.message)
+          else if (e.type === 'run_done') void bus.postMessage(sessionId, e.summary ?? `运行结束:${e.status}`)
+        }
         deps.emit(e)
       }
 

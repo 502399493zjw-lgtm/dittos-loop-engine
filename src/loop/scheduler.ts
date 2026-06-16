@@ -68,7 +68,7 @@ export function loopScheduler(deps: LoopSchedulerDeps): LoopScheduler {
       if (!isDue(spec, state, t)) continue
       // fire-and-forget; swallow per-loop errors so one bad loop doesn't kill the rest
       void Promise.resolve()
-        .then(() => deps.runner.tick(spec.id))
+        .then(() => deps.runner.tick(spec.id, { kind: 'schedule' }))
         .catch(() => {})
     }
   }

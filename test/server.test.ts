@@ -4,6 +4,8 @@ import { createServer } from '../src/server'
 import { fakeExecutor } from '../src/executor/fake'
 import { jsonLoopStore } from '../src/loop/jsonLoopStore'
 import { loopRunner } from '../src/loop/loopRunner'
+import { fakeSessionBus } from '../src/loop/sessionBus'
+import type { FakeSessionBus } from '../src/loop/sessionBus'
 import type { LoopSpec } from '../src/loop/types'
 import type { EngineEvent, Flow } from '../src/types'
 import WebSocket from 'ws'
@@ -31,7 +33,7 @@ const loopSpec = (over: Partial<LoopSpec> = {}): LoopSpec => ({
   id: 'L1', flow: 'demo', trigger: { kind: 'interval', everyMs: 1000 }, ...over,
 })
 
-function loopServer(flows: Record<string, Flow>) {
+function loopServer(flows: Record<string, Flow>, bus?: FakeSessionBus) {
   const dir = mkdtempSync(join(tmpdir(), 'srv-loop-'))
   const memDir = mkdtempSync(join(tmpdir(), 'srv-mem-'))
   const store = jsonLoopStore(dir)
@@ -44,8 +46,9 @@ function loopServer(flows: Record<string, Flow>) {
     flows,
     storeDir: undefined,
     store,
-    makeRunner: (emit: (e: EngineEvent) => void, awaitApproval) =>
-      loopRunner({ store, executor, flows, emit, awaitApproval, notify: () => {}, defaultAgent: 'claude', memoryDir: memDir }),
+    sessionBus: bus,
+    makeRunner: (emit: (e: EngineEvent) => void, awaitApproval, sessionBus) =>
+      loopRunner({ store, executor, flows, emit, awaitApproval, sessionBus, notify: () => {}, defaultAgent: 'claude', memoryDir: memDir }),
   })
   return { srv, store, dir, memDir }
 }
@@ -98,6 +101,32 @@ describe('server — loop endpoints', () => {
     // tick ran: lastRunAt recorded
     const stored = await store.get('L1')
     expect(stored?.state.lastRunAt).toBeTypeOf('number')
+
+    await srv.close()
+  })
+
+  it('POST /loops/:id/trigger opens a session via the configured sessionBus', async () => {
+    const flow: Flow = async (api) => { api.log('working'); return 'ok' }
+    const bus = fakeSessionBus()
+    const { srv } = loopServer({ demo: flow }, bus)
+    const { port } = await srv.listen(0)
+    await fetch(`http://localhost:${port}/loops`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(loopSpec({ projectId: 'proj-1' })),
+    })
+
+    const trig = await fetch(`http://localhost:${port}/loops/L1/trigger`, { method: 'POST' })
+    const { runId } = (await trig.json()) as { runId: string }
+
+    // drain the run so the manual-trigger session lifecycle completes before we assert
+    await new Promise<void>((resolve) => {
+      const ws = new WebSocket(`ws://localhost:${port}/runs/${runId}/events`)
+      ws.on('message', (d) => { const e = JSON.parse(d.toString()); if (e.type === 'run_done') { ws.close(); resolve() } })
+    })
+
+    const created = bus.calls.find((c) => c.kind === 'create')
+    expect(created).toMatchObject({ kind: 'create', projectId: 'proj-1' })
+    const posts = bus.calls.filter((c) => c.kind === 'post').map((c) => (c as { text: string }).text)
+    expect(posts.some((t) => t.includes('你手动触发'))).toBe(true)
 
     await srv.close()
   })

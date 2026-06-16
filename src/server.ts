@@ -6,6 +6,7 @@ import { jsonStore } from './store/jsonStore'
 import type { EngineEvent, Executor, Flow, ApprovalRequest, ApprovalResult } from './types'
 import type { LoopSpec, LoopStore } from './loop/types'
 import type { LoopRunner } from './loop/loopRunner'
+import type { SessionBus } from './loop/sessionBus'
 
 export interface ServerConfig {
   executor: Executor
@@ -15,12 +16,18 @@ export interface ServerConfig {
   /** Loop persistence; required for the /loops endpoints. */
   store?: LoopStore
   /**
+   * When set, each loop run opens a fresh chat session under its project and
+   * auto-mirrors its narration into it; forwarded into the runner via makeRunner.
+   */
+  sessionBus?: SessionBus
+  /**
    * Build the loop runner, wiring its event sink so a loop's run events flow
    * through the same per-run buffer/WS plumbing as ad-hoc /runs. The runner
    * picks the run id internally; the server keys events by `e.runId`.
    * `awaitApproval` is forwarded so loop-triggered runs honour the same gates as /runs.
+   * `sessionBus` (from cfg) is forwarded so loop runs can open + mirror to sessions.
    */
-  makeRunner?: (emit: (e: EngineEvent) => void, awaitApproval: (req: ApprovalRequest) => Promise<ApprovalResult>) => LoopRunner
+  makeRunner?: (emit: (e: EngineEvent) => void, awaitApproval: (req: ApprovalRequest) => Promise<ApprovalResult>, sessionBus?: SessionBus) => LoopRunner
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -65,7 +72,7 @@ export function createServer(cfg: ServerConfig) {
   const makeAwaitApproval = () => (req: ApprovalRequest) =>
     new Promise<ApprovalResult>((resolve) => pendingApprovals.set(`${req.runId}:${req.approvalId}`, resolve))
 
-  const runner = cfg.makeRunner?.(runnerEmit, makeAwaitApproval())
+  const runner = cfg.makeRunner?.(runnerEmit, makeAwaitApproval(), cfg.sessionBus)
 
   const httpServer = http.createServer((req, res) => {
     const url = req.url ?? ''
@@ -136,7 +143,7 @@ export function createServer(cfg: ServerConfig) {
         if (!loaded) { res.writeHead(404).end('unknown loop'); return }
         // Register the capture BEFORE ticking so the run's first event maps to this request.
         const runIdReady = new Promise<string>((resolve) => pendingRunIds.push(resolve))
-        void runner.tick(id) // fire-and-forget; events stream over WS
+        void runner.tick(id, { kind: 'manual' }) // fire-and-forget; events stream over WS
         void runIdReady.then((runId) => {
           res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ runId }))
         })
