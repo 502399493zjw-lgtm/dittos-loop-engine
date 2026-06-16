@@ -24,8 +24,8 @@ function authServer(over?: { user?: { id: number; login: string; name?: string }
   return { srv, github, userStore, tokenStore }
 }
 
-// Extract the URL hash (#...) from a Location header.
-const hashOf = (loc: string) => new URL(loc).hash
+// Extract a query param (?token / ?auth_error) from a Location header.
+const queryOf = (loc: string, key: string) => new URL(loc).searchParams.get(key)
 
 describe('server — auth endpoints', () => {
   it('GET /auth/login 302s to the GitHub authorize URL with a signed state', async () => {
@@ -40,16 +40,15 @@ describe('server — auth endpoints', () => {
     await srv.close()
   })
 
-  it('GET /auth/callback with a valid state mints a token + 302s to appBaseUrl#token=', async () => {
+  it('GET /auth/callback with a valid state mints a token + 302s to appBaseUrl/auth/callback?token=', async () => {
     const { srv } = authServer()
     const { port } = await srv.listen(0)
     const state = signState(sessionSecret)
     const res = await fetch(`http://localhost:${port}/auth/callback?code=x&state=${encodeURIComponent(state)}`, { redirect: 'manual' })
     expect(res.status).toBe(302)
     const loc = res.headers.get('location')!
-    expect(loc.startsWith(appBaseUrl)).toBe(true)
-    const hash = hashOf(loc)
-    expect(hash).toMatch(/^#token=.+/)
+    expect(loc.startsWith(`${appBaseUrl}/auth/callback?`)).toBe(true)
+    expect(queryOf(loc, 'token')).toMatch(/.+/)
     await srv.close()
   })
 
@@ -58,7 +57,7 @@ describe('server — auth endpoints', () => {
     const { port } = await srv.listen(0)
     const state = signState(sessionSecret)
     const cb = await fetch(`http://localhost:${port}/auth/callback?code=x&state=${encodeURIComponent(state)}`, { redirect: 'manual' })
-    const token = hashOf(cb.headers.get('location')!).replace('#token=', '')
+    const token = queryOf(cb.headers.get('location')!, 'token')!
 
     const me = await fetch(`http://localhost:${port}/auth/me`, { headers: { authorization: `Bearer ${token}` } })
     expect(me.status).toBe(200)
@@ -85,14 +84,14 @@ describe('server — auth endpoints', () => {
     await srv.close()
   })
 
-  it('GET /auth/callback with a bad state 302s to appBaseUrl#auth_error=bad_state', async () => {
+  it('GET /auth/callback with a bad state 302s to appBaseUrl/auth/callback?auth_error=bad_state', async () => {
     const { srv } = authServer()
     const { port } = await srv.listen(0)
     const res = await fetch(`http://localhost:${port}/auth/callback?code=x&state=garbage`, { redirect: 'manual' })
     expect(res.status).toBe(302)
     const loc = res.headers.get('location')!
-    expect(loc.startsWith(appBaseUrl)).toBe(true)
-    expect(hashOf(loc)).toBe('#auth_error=bad_state')
+    expect(loc.startsWith(`${appBaseUrl}/auth/callback?`)).toBe(true)
+    expect(queryOf(loc, 'auth_error')).toBe('bad_state')
     await srv.close()
   })
 
@@ -133,7 +132,7 @@ async function gatedServer(over?: { user?: { id: number; login: string; name?: s
   // Mint a token via the real callback flow so it is bound to the upserted user.
   const state = signState(sessionSecret)
   const cb = await fetch(`http://localhost:${port}/auth/callback?code=x&state=${encodeURIComponent(state)}`, { redirect: 'manual' })
-  const token = hashOf(cb.headers.get('location')!).replace('#token=', '')
+  const token = queryOf(cb.headers.get('location')!, 'token')!
   return { srv, port, token }
 }
 
@@ -226,7 +225,7 @@ describe('server — auth middleware gates /loops + /sessions', () => {
       ;(github as { setUser?: (u: { id: number; login: string }) => void }).setUser?.(gh)
       const state = signState(sessionSecret)
       const cb = await fetch(`http://localhost:${port}/auth/callback?code=x&state=${encodeURIComponent(state)}`, { redirect: 'manual' })
-      return hashOf(cb.headers.get('location')!).replace('#token=', '')
+      return queryOf(cb.headers.get('location')!, 'token')!
     }
     const tokenA = await mint({ id: 1, login: 'alice' })
     const tokenB = await mint({ id: 2, login: 'bob' })
@@ -267,7 +266,7 @@ describe('server — auth middleware gates /loops + /sessions', () => {
       ;(github as { setUser?: (u: { id: number; login: string }) => void }).setUser?.(gh)
       const state = signState(sessionSecret)
       const cb = await fetch(`http://localhost:${port}/auth/callback?code=x&state=${encodeURIComponent(state)}`, { redirect: 'manual' })
-      return hashOf(cb.headers.get('location')!).replace('#token=', '')
+      return queryOf(cb.headers.get('location')!, 'token')!
     }
     const tokenA = await mint({ id: 1, login: 'alice' })
     const tokenB = await mint({ id: 2, login: 'bob' })

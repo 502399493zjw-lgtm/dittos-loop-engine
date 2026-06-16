@@ -482,25 +482,29 @@ export function createServer(cfg: ServerConfig) {
       }
 
       if (method === 'GET' && path === '/auth/callback') {
+        // Redirect back to the SPA's CallbackPage route as a query (?token / ?auth_error),
+        // not a #hash — the SPA reads ?token off /auth/callback. appBaseUrl has no
+        // trailing slash, so the route path is appended directly.
+        const callbackUrl = `${appBaseUrl}/auth/callback`
         const params = new URL(url, 'http://x').searchParams
         const code = params.get('code') ?? ''
         const state = params.get('state') ?? ''
         if (!verifyState(state, sessionSecret)) {
-          res.writeHead(302, { location: `${appBaseUrl}#auth_error=bad_state` }).end()
+          res.writeHead(302, { location: `${callbackUrl}?auth_error=bad_state` }).end()
           return
         }
         // Wrap the exchange so a failing GitHub round-trip lands the user on an
-        // error hash, never a 500 dead end.
+        // error query, never a 500 dead end.
         void (async () => {
           try {
             const accessToken = await github.exchangeCode(code)
             const gh = await github.fetchUser(accessToken)
             const user = await userStore.upsertByGithub(gh)
             const token = await tokenStore.issue(user.id)
-            res.writeHead(302, { location: `${appBaseUrl}#token=${token}` }).end()
+            res.writeHead(302, { location: `${callbackUrl}?token=${encodeURIComponent(token)}` }).end()
           } catch (err) {
             const reason = encodeURIComponent(err instanceof Error ? err.message : 'exchange_failed')
-            res.writeHead(302, { location: `${appBaseUrl}#auth_error=${reason}` }).end()
+            res.writeHead(302, { location: `${callbackUrl}?auth_error=${reason}` }).end()
           }
         })()
         return

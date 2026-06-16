@@ -11,7 +11,7 @@ import type { Project } from '../src/project/types'
 
 const sessionSecret = 'test-session-secret'
 const appBaseUrl = 'http://localhost:5173'
-const hashOf = (loc: string) => new URL(loc).hash
+const queryOf = (loc: string, key: string) => new URL(loc).searchParams.get(key)
 
 function projectServer(withStore = true) {
   const projectStore = withStore
@@ -139,7 +139,7 @@ describe('server — projects auth gating + owner scoping', () => {
       ;(github as { setUser?: (u: { id: number; login: string }) => void }).setUser?.(gh)
       const state = signState(sessionSecret)
       const cb = await fetch(`http://localhost:${port}/auth/callback?code=x&state=${encodeURIComponent(state)}`, { redirect: 'manual' })
-      return hashOf(cb.headers.get('location')!).replace('#token=', '')
+      return queryOf(cb.headers.get('location')!, 'token')!
     }
     const tokenA = await mint({ id: 1, login: 'alice' })
     const tokenB = await mint({ id: 2, login: 'bob' })
