@@ -37,6 +37,7 @@ export type EngineEvent =
   | { type: 'agent_done'; runId: string; nodeId: string; status: 'ok' | 'failed'; result?: string; error?: string; cost?: number; durationMs: number; ts: number }
   | { type: 'phase_done'; runId: string; phaseId: string; status: 'ok' | 'failed'; ts: number }
   | { type: 'log'; runId: string; message: string; ts: number }
+  | { type: 'budget_exceeded'; runId: string; spent: number; cap: number; ts: number }
   | { type: 'run_done'; runId: string; status: RunStatus; summary?: string; result?: unknown; ts: number }
 
 export interface FlowApi {
@@ -54,6 +55,8 @@ export interface RunDeps {
   executor: Executor
   defaultAgent: string
   args?: unknown
+  /** per-run cost cap in USD; undefined = no cap */
+  budgetUsd?: number
   emit: (e: EngineEvent) => void
   /** injectable for deterministic tests */
   now?: () => number

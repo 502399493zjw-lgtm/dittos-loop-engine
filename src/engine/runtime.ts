@@ -1,11 +1,20 @@
 import type { EngineEvent, FlowApi, Flow, RunDeps, RunStatus, AgentOpts } from '../types'
 import { makeIdGen, wallClock } from './ids'
 
+/** Thrown when cumulative run cost reaches the per-run budget cap; turned into a `failed` run by runFlow's catch. */
+export class BudgetExceeded extends Error {
+  constructor(public readonly spent: number) {
+    super(`budget exceeded: spent ${spent}`)
+    this.name = 'BudgetExceeded'
+  }
+}
+
 export async function runFlow(flow: Flow, deps: RunDeps): Promise<{ status: RunStatus; result?: unknown }> {
   const now = deps.now ?? wallClock
   const nextId = deps.nextId ?? makeIdGen()
   const { runId, executor, defaultAgent, emit } = deps
   let activePhase: string | null = null
+  let spent = 0
 
   emit({ type: 'run_started', runId, args: deps.args, ts: now() })
 
@@ -17,16 +26,26 @@ export async function runFlow(flow: Flow, deps: RunDeps): Promise<{ status: RunS
     const label = opts.label ?? prompt.slice(0, 40)
     emit({ type: 'agent_started', runId, nodeId, phaseId, agentId, label, prompt, ts: now() })
     const start = now()
+    let parsed: string | Record<string, unknown>
+    let cost = 0
     try {
       const res = await executor.run({ agentId, prompt, model: opts.model, schema: opts.schema })
       emit({ type: 'agent_done', runId, nodeId, status: 'ok', result: res.text, cost: res.cost, durationMs: now() - start, ts: now() })
-      if (opts.schema) { try { return JSON.parse(res.text) as Record<string, unknown> } catch { return res.text } }
-      return res.text
+      cost = res.cost ?? 0
+      if (opts.schema) { try { parsed = JSON.parse(res.text) as Record<string, unknown> } catch { parsed = res.text } }
+      else parsed = res.text
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       emit({ type: 'agent_done', runId, nodeId, status: 'failed', error: msg, durationMs: now() - start, ts: now() })
       throw err
     }
+    // Budget accounting happens AFTER the agent succeeds — exceeding the cap fails the run, not the node.
+    spent += cost
+    if (deps.budgetUsd != null && spent >= deps.budgetUsd) {
+      emit({ type: 'budget_exceeded', runId, spent, cap: deps.budgetUsd, ts: now() })
+      throw new BudgetExceeded(spent)
+    }
+    return parsed
   }
 
   const api: FlowApi & { __runAgent: typeof runAgent } = {
