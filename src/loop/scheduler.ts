@@ -43,12 +43,16 @@ function minute(x: number | undefined): number {
  */
 function isDue(spec: LoopSpec, state: LoopState, t: number): boolean {
   const tr = spec.trigger
+  // No trigger (one-shot) or a non-timer kind (self-paced/event/condition/manual)
+  // is never *due* on the interval sweep.
+  if (!tr) return false
   switch (tr.kind) {
     case 'cron':
-      return cronMatches(tr.expr, new Date(t)) && minute(state.lastRunAt) < minute(t)
+      return tr.expr != null && cronMatches(tr.expr, new Date(t)) && minute(state.lastRunAt) < minute(t)
     case 'interval':
+      return tr.everyMs != null && t - (state.lastRunAt ?? 0) >= tr.everyMs
     default:
-      return t - (state.lastRunAt ?? 0) >= tr.everyMs
+      return false
   }
 }
 export function loopScheduler(deps: LoopSchedulerDeps): LoopScheduler {
