@@ -36,7 +36,7 @@ import type { StreamExecutor } from './chat/streamExecutor'
 import type { DaemonHub } from './daemon/daemonHub'
 
 /** The demo agent prompt; the fake executor's reply is keyed to it for determinism. */
-const DEMO_PROMPT = '用一句话友好地跟用户打个招呼,说明你是 Dittos 的 Loop Flow agent。'
+const DEMO_PROMPT = '用一句话友好地跟用户打个招呼,说明你是 Dittos 的 Live Loop agent。'
 
 /** A tiny one-step flow: greet the user via the default agent and return the greeting. */
 export const demoFlow: Flow = async (api) => {
@@ -102,7 +102,7 @@ export function buildExecutor(): Executor {
   const real = process.env.RUN_REAL === '1'
   return real
     ? claudeCliExecutor()
-    : fakeExecutor({ replies: { [`claude:${DEMO_PROMPT}`]: { text: '你好!我是 Dittos 的 Loop Flow agent。' } } })
+    : fakeExecutor({ replies: { [`claude:${DEMO_PROMPT}`]: { text: '你好!我是 Dittos 的 Live Loop agent。' } } })
 }
 
 /** The daemon-mode wiring: one remote executor serving BOTH seams + the WS auth config. */

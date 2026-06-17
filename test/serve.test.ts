@@ -13,7 +13,7 @@ describe('serve — demo wiring', () => {
     const executor = buildExecutor() // RUN_REAL unset → fake, keyed to the demo prompt
     const res = await runFlow(demoFlow, { runId: 'serve-1', executor, defaultAgent: 'claude', emit: () => {} })
     expect(res.status).toBe('completed')
-    expect(res.result).toContain('Loop Flow')
+    expect(res.result).toContain('Live Loop')
   })
 
   it('seedDemoLoop creates demo-loop when absent', async () => {
