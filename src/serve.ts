@@ -46,7 +46,47 @@ export const demoFlow: Flow = async (api) => {
   return g
 }
 
-export const flows: Record<string, Flow> = { demo: demoFlow }
+/**
+ * A representative multi-phase "用户群反馈" loop flow, mirroring the promo video's
+ * logic: scan+classify → process (parallel drafts) → human approval gate →
+ * summary. Each api.agent() is a real model turn (via the linked daemon in
+ * prod). Prompts are self-contained (sample feedback inline) so no tools/
+ * connectors are needed, and ask for short outputs so the work-cards stay
+ * readable.
+ */
+const FEEDBACK_BATCH = [
+  '买家A：项链戴了一周扣环就松了，能换吗？',
+  '买家B：你们有没有情侣对戒款式？',
+  '买家C：下单五天了物流还没更新，太慢了。',
+  '买家D：手机上打开预览页面是空白的。',
+]
+
+export const feedbackFlow: Flow = async (api) => {
+  api.phase('扫描归类')
+  api.log(`读取 ${FEEDBACK_BATCH.length} 条用户反馈`)
+  const classified = await api.agent(
+    `把下面的用户反馈按类别归类（咨询 / 退换 / 物流 / Bug）。每条输出一行，格式"类别：原话摘要"，不要解释：\n${FEEDBACK_BATCH.join('\n')}`,
+    { label: '归类' },
+  )
+
+  api.phase('处理')
+  const [reply, bugNote] = await api.parallel([
+    () => api.agent('针对"项链扣环松了想换货"的买家，写一条 50 字以内、共情并给出下一步的中文客服回复。只输出回复正文。', { label: '退换草稿' }),
+    () => api.agent('把"手机打开预览页面空白"这个 bug 整理成一句给工程师的复现要点。只输出这一句。', { label: 'Bug 整理' }),
+  ])
+
+  api.phase('审批')
+  const { decision } = await api.approval('这批客服回复草稿是否批准发送？', { options: ['批准', '驳回'] })
+
+  api.phase('汇总')
+  const summary = await api.agent(
+    `用三行中文总结本轮处理：第一行归类概况，第二行草稿要点，第三行审批结论（${decision}）。每行一句话。`,
+    { label: '日报' },
+  )
+  return { classified, reply, bugNote, decision, summary }
+}
+
+export const flows: Record<string, Flow> = { demo: demoFlow, feedback: feedbackFlow }
 
 /** RUN_REAL=1 → real `claude -p`; otherwise the fake keyed to the demo prompt. */
 export function buildExecutor(): Executor {
