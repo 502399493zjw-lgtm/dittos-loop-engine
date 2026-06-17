@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto'
 import { runFlow } from './engine/runtime'
 import { jsonStore } from './store/jsonStore'
 import type { EngineEvent, Executor, Flow, ApprovalRequest, ApprovalResult } from './types'
-import type { LoopSpec, LoopStore } from './loop/types'
+import type { LoopSpec, LoopStore, ExecutionBody, Step, TriggerSpec } from './loop/types'
+import { compileDefaults, validateContract } from './loop/contract'
 import type { LoopRunner } from './loop/loopRunner'
 import type { SessionBus } from './loop/sessionBus'
 import type { SessionStore } from './session/types'
@@ -455,10 +456,12 @@ export function createServer(cfg: ServerConfig) {
       return
     }
 
-    // Conversational creation: turn a chat session into a Live Loop. Reads the
-    // transcript, asks the agent (the user's daemon) to distil a {name, trigger,
-    // instructions} spec, then persists a generic `agentLoop` loop owned by the
-    // user. No forms — the loop is shaped entirely by the conversation.
+    // Conversational creation: turn a chat session into a Loop. Reads the
+    // transcript, asks the agent (the user's daemon) to distil a FULL loop
+    // *contract* (name/mode/goal/trigger/escalation/stop + a structured execution
+    // body of steps — the "workflow"), then runs it through compileDefaults +
+    // validateContract (so a stop rule is guaranteed) and persists a `flow:"contract"`
+    // loop owned by the user. No forms — the loop is shaped entirely by the conversation.
     if (method === 'POST' && url === '/loops/from-session') {
       if (!cfg.store || !cfg.sessionStore) { res.writeHead(500).end('no loop/session store'); return }
       void readBody(req).then(async (body) => {
@@ -471,14 +474,19 @@ export function createServer(cfg: ServerConfig) {
             .join('\n')
           if (!transcript.trim()) { res.writeHead(422).end('empty conversation'); return }
           const prompt = [
-            '从下面这段对话中，提炼出用户想要的「Live Loop」（按计划自动重复运行的任务）的配置。',
+            '从下面这段对话中，提炼出用户想要的「Loop」的完整契约（contract）。',
             '只输出一个 JSON 对象，不要任何解释、不要 markdown 代码块。字段：',
             '- name: 简短中文名（≤12字）',
-            '- triggerKind: "interval" 或 "cron"',
-            '- everyMs: triggerKind=interval 时的间隔毫秒数（如每小时=3600000）',
-            '- cron: triggerKind=cron 时的 cron 表达式',
-            '- instructions: 每一轮要做的事，写成完整自包含的一段指令（不要引用"上面对话"）',
-            '若用户没说清触发频率，默认 triggerKind=interval, everyMs=3600000。',
+            '- mode: "one-shot"（只跑一次把一件复杂事做完）/ "live"（按计划长期重复）/ "project"（围绕一个长期项目职责）',
+            '- goal: 一句话说明这个 Loop 负责什么',
+            '- trigger: 对象 { kind, everyMs?, expr?, description }。kind 取 "interval"|"cron"|"manual"|"self-paced"；interval 用 everyMs（如每小时=3600000），cron 用 expr；description 是给人看的中文短描述（如"每小时"）。一次性任务用 {"kind":"manual","description":"手动触发"}。若用户没说清频率，默认 {"kind":"interval","everyMs":3600000,"description":"每小时"}。',
+            '- escalation: 字符串数组，越过前要先问用户的边界（涉及钱/退款/线上/对外承诺/不可逆/长期记忆等）；没有就给 []。',
+            '- stop: 一句话的停止/取消规则（必填）。',
+            '- body: { "steps": [...] } —— 多步执行体（即"工作流"）。把任务拆成几个具体步骤；',
+            '  每个 step 形如 { "id", "kind":"agent"|"parallel"|"phase", "label", "prompt?", "children?" }；',
+            '  agent 步骤用 prompt 写清这一步做什么；相互独立的步骤用 kind:"parallel" 并把它们放进 children。',
+            '  请把任务分解成几个具体步骤，独立的步骤用 parallel。',
+            '只输出 JSON。',
             '',
             '对话：',
             transcript,
@@ -487,20 +495,52 @@ export function createServer(cfg: ServerConfig) {
             agentId: cfg.defaultAgent, prompt,
             ...(userId !== undefined ? { ownerId: userId } : {}),
           })
+          // Same lenient parse as before: the first {...} substring.
           const m = out.text.match(/\{[\s\S]*\}/)
           if (!m) { res.writeHead(422, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'could not parse spec', raw: out.text })); return }
-          const parsed = JSON.parse(m[0]) as { name?: string; triggerKind?: string; everyMs?: number; cron?: string; instructions?: string }
-          const trigger: LoopSpec['trigger'] = parsed.triggerKind === 'cron' && parsed.cron
-            ? { kind: 'cron', expr: parsed.cron }
-            : { kind: 'interval', everyMs: typeof parsed.everyMs === 'number' && parsed.everyMs > 0 ? parsed.everyMs : 3600000 }
-          const spec: LoopSpec = {
+          const parsed = JSON.parse(m[0]) as {
+            name?: string
+            mode?: LoopSpec['mode']
+            goal?: string
+            trigger?: { kind?: string; everyMs?: number; expr?: string; description?: string }
+            escalation?: string[]
+            stop?: string
+            body?: { steps?: Step[] }
+          }
+
+          // Map the parsed trigger onto the spec's trigger union. `manual`/`self-paced`
+          // carry no schedule; interval/cron fill everyMs/expr. Keep the full TriggerSpec
+          // (with description) when a kind is given; default to a 1h interval otherwise.
+          const pt = parsed.trigger
+          let trigger: LoopSpec['trigger'] | undefined
+          if (pt?.kind === 'cron' && pt.expr) {
+            trigger = { kind: 'cron', expr: pt.expr, description: pt.description ?? '' } as TriggerSpec
+          } else if (pt?.kind === 'interval' && typeof pt.everyMs === 'number' && pt.everyMs > 0) {
+            trigger = { kind: 'interval', everyMs: pt.everyMs, description: pt.description ?? '' } as TriggerSpec
+          } else if (pt?.kind === 'manual' || pt?.kind === 'self-paced') {
+            trigger = { kind: pt.kind, description: pt.description ?? '' } as TriggerSpec
+          } else {
+            trigger = { kind: 'interval', everyMs: 3600000, description: pt?.description ?? '每小时' } as TriggerSpec
+          }
+
+          const execBody: ExecutionBody = { steps: Array.isArray(parsed.body?.steps) ? parsed.body!.steps! : [] }
+
+          // Build the partial contract, then fill mandatory defaults (stop, mode) and
+          // validate (a stop rule is guaranteed) before persisting.
+          const partial: Partial<LoopSpec> = {
             id: randomUUID(),
-            flow: 'agentLoop',
-            name: (parsed.name ?? '新 Live Loop').slice(0, 24),
-            instructions: parsed.instructions ?? '',
+            flow: 'contract',
+            name: (parsed.name ?? '新 Loop').slice(0, 24),
+            ...(parsed.mode !== undefined ? { mode: parsed.mode } : {}),
+            ...(parsed.goal !== undefined ? { goal: parsed.goal } : {}),
             trigger,
+            ...(Array.isArray(parsed.escalation) ? { escalation: parsed.escalation } : {}),
+            ...(parsed.stop !== undefined ? { stop: parsed.stop } : {}),
+            body: execBody,
             ...(userId !== undefined ? { ownerId: userId } : {}),
           }
+          const spec = compileDefaults(partial)
+          validateContract(spec)
           await cfg.store!.upsert(spec)
           res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(spec))
         } catch (e) {
