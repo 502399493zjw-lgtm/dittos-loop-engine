@@ -85,7 +85,9 @@ export function loopRunner(deps: LoopRunnerDeps): LoopRunner {
         // daemon. Forwarded only when the loop is owned; unowned dev loops route
         // to the in-process executor, which ignores it.
         ...(spec.ownerId !== undefined ? { ownerId: spec.ownerId } : {}),
-        args: { cursor: state.cursor },
+        // The generic `agentLoop` flow reads its per-round task + name from here
+        // (conversational creation); bespoke flows just ignore the extra keys.
+        args: { cursor: state.cursor, instructions: spec.instructions, name: spec.name },
         budgetUsd: spec.budgetUsd,
         memory,
         awaitApproval: deps.awaitApproval,

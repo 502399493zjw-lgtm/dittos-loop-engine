@@ -1,6 +1,10 @@
 export interface LoopSpec {
   id: string
   flow: string                 // key into the server's flows registry
+  /** Human-readable display name (the chat-created title). Falls back to id. */
+  name?: string
+  /** Per-round task for the generic `agentLoop` flow (conversational creation). */
+  instructions?: string
   trigger:
     | { kind: 'interval'; everyMs: number }
     | { kind: 'cron'; expr: string }

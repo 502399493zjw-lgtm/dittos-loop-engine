@@ -95,7 +95,30 @@ export const feedbackFlow: Flow = async (api) => {
   return { classified, reply, bugNote, decision, summary }
 }
 
-export const flows: Record<string, Flow> = { demo: demoFlow, feedback: feedbackFlow }
+/**
+ * The generic, conversationally-created Live Loop flow. A loop made via
+ * `POST /loops/from-session` carries its per-round task in `spec.instructions`
+ * (threaded into `api.args` by the runner); each cycle this flow just runs that
+ * task as one agent turn. This is what lets users create loops by chatting —
+ * no bespoke flow code per loop.
+ */
+export const agentLoopFlow: Flow = async (api) => {
+  const args = (api.args ?? {}) as { instructions?: string; name?: string }
+  const task = (args.instructions ?? '').trim() || '（本轮没有具体任务说明）'
+  api.phase('执行')
+  api.log(`Live Loop「${args.name ?? '未命名'}」本轮执行`)
+  const out = await api.agent(
+    [
+      '你是一个按计划自动运行的 Live Loop agent。下面是这一轮要完成的任务：',
+      task,
+      '请直接完成任务并给出结果（简洁、可直接交付，不要复述任务本身）。',
+    ].join('\n\n'),
+    { label: '执行' },
+  )
+  return out
+}
+
+export const flows: Record<string, Flow> = { demo: demoFlow, feedback: feedbackFlow, agentLoop: agentLoopFlow }
 
 /** RUN_REAL=1 → real `claude -p`; otherwise the fake keyed to the demo prompt. */
 export function buildExecutor(): Executor {

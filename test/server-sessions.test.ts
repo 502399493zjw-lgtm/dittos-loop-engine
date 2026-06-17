@@ -4,6 +4,7 @@ import { createServer } from '../src/server'
 import { fakeExecutor } from '../src/executor/fake'
 import { jsonSessionStore } from '../src/session/jsonSessionStore'
 import { jsonProjectStore } from '../src/project/jsonProjectStore'
+import { jsonLoopStore } from '../src/loop/jsonLoopStore'
 import { fakeGithubOAuth } from '../src/auth/github'
 import { signState } from '../src/auth/state'
 import { jsonUserStore } from '../src/auth/jsonUserStore'
@@ -126,6 +127,53 @@ describe('server — session endpoints', () => {
     })).json()) as Session
     // No projectId supplied → server resolved it to the user's home project.
     expect(session.projectId).toBe(home.id)
+    await srv.close()
+  })
+
+  it('POST /loops/from-session distils the chat transcript into an agentLoop Live Loop', async () => {
+    // An executor that returns the extracted spec as JSON wrapped in prose —
+    // exercises the endpoint's lenient {…} extraction.
+    const jsonExec = {
+      async run() {
+        return { text: '好的，这是配置：{"name":"trending 日报","triggerKind":"interval","everyMs":3600000,"instructions":"汇总今天的 GitHub trending 并整理成三条发我"} 完成。', cost: 0 }
+      },
+    }
+    const sessionStore = jsonSessionStore(mkdtempSync(join(tmpdir(), 'srv-sess-')))
+    const loopStore = jsonLoopStore(mkdtempSync(join(tmpdir(), 'srv-loop-')))
+    const srv = createServer({
+      executor: jsonExec, defaultAgent: 'claude', flows: {}, storeDir: undefined,
+      sessionStore, store: loopStore,
+      projectStore: jsonProjectStore(mkdtempSync(join(tmpdir(), 'srv-proj-'))),
+      auth: {
+        github: fakeGithubOAuth({ user: { id: 7, login: 'u', name: 'U' } }),
+        userStore: jsonUserStore(mkdtempSync(join(tmpdir(), 'srv-user-'))),
+        tokenStore: jsonTokenStore(mkdtempSync(join(tmpdir(), 'srv-token-'))),
+        sessionSecret, appBaseUrl: 'http://localhost:5173',
+      },
+    })
+    const { port } = await srv.listen(0)
+    const token = await mintToken(port)
+
+    // Seed a conversation describing the loop.
+    const session = await sessionStore.createSession(undefined, { title: 'draft' })
+    await sessionStore.appendMessage(session.id, { sender_type: 'user', type: 'text', content: { text: '帮我每小时汇总一次 GitHub trending' } })
+
+    const res = await fetch(`http://localhost:${port}/loops/from-session`, {
+      method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ sessionId: session.id }),
+    })
+    expect(res.status).toBe(200)
+    const spec = (await res.json()) as { id: string; flow: string; name: string; instructions: string; trigger: { kind: string; everyMs?: number }; ownerId?: string }
+    expect(spec.flow).toBe('agentLoop')
+    expect(spec.name).toBe('trending 日报')
+    expect(spec.instructions).toContain('GitHub trending')
+    expect(spec.trigger).toEqual({ kind: 'interval', everyMs: 3600000 })
+    expect(spec.ownerId).toBeTruthy()
+
+    // It persisted + is owner-scoped on GET /loops.
+    const loops = (await (await fetch(`http://localhost:${port}/loops`, { headers: { Authorization: `Bearer ${token}` } })).json()) as Array<{ spec: { id: string } }>
+    expect(loops.map((l) => l.spec.id)).toContain(spec.id)
+
     await srv.close()
   })
 

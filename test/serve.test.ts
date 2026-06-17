@@ -2,11 +2,27 @@ import { describe, it, expect } from 'vitest'
 import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path'
 import { runFlow } from '../src/engine/runtime'
 import { jsonLoopStore } from '../src/loop/jsonLoopStore'
-import { buildExecutor, demoFlow, flows, seedDemoLoop } from '../src/serve'
+import { fakeExecutor } from '../src/executor/fake'
+import { agentLoopFlow, buildExecutor, demoFlow, flows, seedDemoLoop } from '../src/serve'
 
 describe('serve — demo wiring', () => {
   it('flows registry exposes the demo flow', () => {
     expect(flows.demo).toBe(demoFlow)
+  })
+
+  it('flows registry exposes the generic agentLoop flow', () => {
+    expect(flows.agentLoop).toBe(agentLoopFlow)
+  })
+
+  it('agentLoopFlow runs its instructions as one agent turn', async () => {
+    const executor = fakeExecutor() // default: echoes the prompt
+    const res = await runFlow(agentLoopFlow, {
+      runId: 'al-1', executor, defaultAgent: 'claude',
+      args: { instructions: '汇总今天的 GitHub trending 并发我', name: '日报' }, emit: () => {},
+    })
+    expect(res.status).toBe('completed')
+    // The flow embeds the instructions in the agent prompt; the fake echoes it back.
+    expect(String(res.result)).toContain('汇总今天的 GitHub trending 并发我')
   })
 
   it('demoFlow returns a deterministic greeting through the fake executor', async () => {

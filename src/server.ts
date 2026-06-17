@@ -455,6 +455,61 @@ export function createServer(cfg: ServerConfig) {
       return
     }
 
+    // Conversational creation: turn a chat session into a Live Loop. Reads the
+    // transcript, asks the agent (the user's daemon) to distil a {name, trigger,
+    // instructions} spec, then persists a generic `agentLoop` loop owned by the
+    // user. No forms — the loop is shaped entirely by the conversation.
+    if (method === 'POST' && url === '/loops/from-session') {
+      if (!cfg.store || !cfg.sessionStore) { res.writeHead(500).end('no loop/session store'); return }
+      void readBody(req).then(async (body) => {
+        try {
+          const { sessionId } = JSON.parse(body || '{}') as { sessionId?: string }
+          if (!sessionId) { res.writeHead(400).end('sessionId required'); return }
+          const msgs = await cfg.sessionStore!.getMessages(sessionId)
+          const transcript = msgs
+            .map((m) => `${m.sender_type === 'user' ? '用户' : 'agent'}: ${(m.content as { text?: string }).text ?? ''}`)
+            .join('\n')
+          if (!transcript.trim()) { res.writeHead(422).end('empty conversation'); return }
+          const prompt = [
+            '从下面这段对话中，提炼出用户想要的「Live Loop」（按计划自动重复运行的任务）的配置。',
+            '只输出一个 JSON 对象，不要任何解释、不要 markdown 代码块。字段：',
+            '- name: 简短中文名（≤12字）',
+            '- triggerKind: "interval" 或 "cron"',
+            '- everyMs: triggerKind=interval 时的间隔毫秒数（如每小时=3600000）',
+            '- cron: triggerKind=cron 时的 cron 表达式',
+            '- instructions: 每一轮要做的事，写成完整自包含的一段指令（不要引用"上面对话"）',
+            '若用户没说清触发频率，默认 triggerKind=interval, everyMs=3600000。',
+            '',
+            '对话：',
+            transcript,
+          ].join('\n')
+          const out = await cfg.executor.run({
+            agentId: cfg.defaultAgent, prompt,
+            ...(userId !== undefined ? { ownerId: userId } : {}),
+          })
+          const m = out.text.match(/\{[\s\S]*\}/)
+          if (!m) { res.writeHead(422, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'could not parse spec', raw: out.text })); return }
+          const parsed = JSON.parse(m[0]) as { name?: string; triggerKind?: string; everyMs?: number; cron?: string; instructions?: string }
+          const trigger: LoopSpec['trigger'] = parsed.triggerKind === 'cron' && parsed.cron
+            ? { kind: 'cron', expr: parsed.cron }
+            : { kind: 'interval', everyMs: typeof parsed.everyMs === 'number' && parsed.everyMs > 0 ? parsed.everyMs : 3600000 }
+          const spec: LoopSpec = {
+            id: randomUUID(),
+            flow: 'agentLoop',
+            name: (parsed.name ?? '新 Live Loop').slice(0, 24),
+            instructions: parsed.instructions ?? '',
+            trigger,
+            ...(userId !== undefined ? { ownerId: userId } : {}),
+          }
+          await cfg.store!.upsert(spec)
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(spec))
+        } catch (e) {
+          res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: String(e instanceof Error ? e.message : e) }))
+        }
+      })
+      return
+    }
+
     const trigger = /^\/loops\/([^/]+)\/trigger$/.exec(url)
     if (method === 'POST' && trigger) {
       const id = trigger[1]!
