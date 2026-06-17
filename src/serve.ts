@@ -49,8 +49,9 @@ export const demoFlow: Flow = async (api) => {
 
 /**
  * A representative multi-phase "用户群反馈" loop flow, mirroring the promo video's
- * logic: scan+classify → process (parallel drafts) → human approval gate →
- * summary. Each api.agent() is a real model turn (via the linked daemon in
+ * logic: scan+classify → process (parallel drafts) → summary. There is NO
+ * in-flow approval gate — per the loop design, escalation is handled at the loop
+ * level instead. Each api.agent() is a real model turn (via the linked daemon in
  * prod). Prompts are self-contained (sample feedback inline) so no tools/
  * connectors are needed, and ask for short outputs so the work-cards stay
  * readable.
@@ -76,24 +77,25 @@ export const feedbackFlow: Flow = async (api) => {
     () => api.agent('把"手机打开预览页面空白"这个 bug 整理成一句给工程师的复现要点。只输出这一句。', { label: 'Bug 整理' }),
   ])
 
-  api.phase('审批')
-  const { decision } = await api.approval('这批客服回复草稿是否批准发送？', { options: ['批准', '驳回'] })
+  // No in-flow approval gate: per the loop design, escalation is handled at the
+  // loop level (a loop-level escalation boundary replaces the old per-flow gate),
+  // so shipped loop flows run end-to-end without parking for human approval.
+  api.log('(本轮如涉及升级边界，留待 loop 升级处理)')
 
   api.phase('汇总')
   // Each api.agent() is a stateless turn, so the summary agent only knows what
   // we hand it — thread the prior results into the prompt explicitly.
   const summary = await api.agent(
     [
-      '下面是本轮用户反馈处理的结果。请用三行中文写一句话简报，不要多余解释：',
-      '第一行：归类概况；第二行：客服草稿要点；第三行：审批结论。',
-      `审批结论：${decision}`,
+      '下面是本轮用户反馈处理的结果。请用两行中文写一句话简报，不要多余解释：',
+      '第一行：归类概况；第二行：客服草稿要点。',
       `【归类】\n${String(classified)}`,
       `【退换草稿】\n${String(reply ?? '')}`,
       `【Bug 复现】\n${String(bugNote ?? '')}`,
     ].join('\n\n'),
     { label: '日报' },
   )
-  return { classified, reply, bugNote, decision, summary }
+  return { classified, reply, bugNote, summary }
 }
 
 /**

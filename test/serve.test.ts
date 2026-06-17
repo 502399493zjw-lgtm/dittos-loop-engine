@@ -3,7 +3,8 @@ import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import 
 import { runFlow } from '../src/engine/runtime'
 import { jsonLoopStore } from '../src/loop/jsonLoopStore'
 import { fakeExecutor } from '../src/executor/fake'
-import { agentLoopFlow, buildExecutor, demoFlow, flows, seedDemoLoop } from '../src/serve'
+import { agentLoopFlow, buildExecutor, demoFlow, feedbackFlow, flows, seedDemoLoop } from '../src/serve'
+import type { EngineEvent } from '../src/types'
 
 describe('serve — demo wiring', () => {
   it('flows registry exposes the demo flow', () => {
@@ -23,6 +24,19 @@ describe('serve — demo wiring', () => {
     expect(res.status).toBe('completed')
     // The flow embeds the instructions in the agent prompt; the fake echoes it back.
     expect(String(res.result)).toContain('汇总今天的 GitHub trending 并发我')
+  })
+
+  it('feedbackFlow runs to completion without an in-flow approval gate', async () => {
+    // Per the loop design, no shipped loop flow uses an in-flow approval gate;
+    // escalation is handled at the loop level instead. So feedbackFlow must NOT
+    // emit approval_requested.
+    const executor = fakeExecutor() // default: echoes the prompt
+    const events: EngineEvent[] = []
+    const res = await runFlow(feedbackFlow, {
+      runId: 'fb-1', executor, defaultAgent: 'claude', emit: (e: EngineEvent) => events.push(e),
+    })
+    expect(res.status).toBe('completed')
+    expect(events.some((e) => e.type === 'approval_requested')).toBe(false)
   })
 
   it('demoFlow returns a deterministic greeting through the fake executor', async () => {
