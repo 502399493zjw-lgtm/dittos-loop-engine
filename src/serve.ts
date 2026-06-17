@@ -29,8 +29,9 @@ import { claudeStreamExecutor } from './chat/streamExecutor'
 import { githubOAuth } from './auth/github'
 import { jsonUserStore } from './auth/jsonUserStore'
 import { jsonTokenStore } from './auth/jsonTokenStore'
+import { runBody } from './loop/executionBody'
 import type { Executor, Flow } from './types'
-import type { LoopStore } from './loop/types'
+import type { LoopStore, LoopSpec, ExecutionBody } from './loop/types'
 import type { ServerConfig } from './server'
 import type { StreamExecutor } from './chat/streamExecutor'
 import type { DaemonHub } from './daemon/daemonHub'
@@ -118,7 +119,100 @@ export const agentLoopFlow: Flow = async (api) => {
   return out
 }
 
-export const flows: Record<string, Flow> = { demo: demoFlow, feedback: feedbackFlow, agentLoop: agentLoopFlow }
+/**
+ * The 乙 contract flow — the canonical per-tick runtime for the unified Loop model
+ * (spec §6). It receives the loop *contract* in `api.args.contract`; each tick it:
+ *
+ *   1. builds an escalation preamble from `contract.escalation` (prompt-guidance
+ *      only in v1 — auto-pause is a later iteration);
+ *   2. asks the agent for *this run's* execution body, seeded by the stored body
+ *      (the PLAN step). Usually the agent returns the stored body verbatim; only
+ *      when the situation calls for it does it adapt (add/remove/edit steps);
+ *   3. runs whichever body it got via `runBody`;
+ *   4. returns `{ adapted, body }` so a later adopt-run flow can persist the
+ *      adapted body on the user's consent (decision #4).
+ *
+ * `adapted` is detected purely structurally: parse the first `{...}` JSON
+ * substring from the plan reply; if parsing fails OR the parsed body is
+ * deep-equal (via stable `JSON.stringify`) to the stored body → run the stored
+ * body, `adapted=false`; otherwise run the parsed body, `adapted=true`.
+ *
+ * Legacy fallback: a contract with no stored body runs `contract.instructions`
+ * (or a default) as ONE agent call and returns its text — preserving the thin
+ * `agentLoop`-style behaviour for old minimal specs.
+ */
+export const contractFlow: Flow = async (api) => {
+  const args = (api.args ?? {}) as { contract?: LoopSpec; reason?: string; cursor?: unknown }
+  const contract = args.contract
+  const stored = contract?.body
+
+  // Escalation preamble (spec §6, decision #3): prompt-guidance only in v1.
+  const escalation = contract?.escalation ?? []
+  const preamble = escalation.length
+    ? '升级边界——不要越过；若本轮任务需要其中之一，停下并说明，不要擅自执行：\n' +
+      escalation.map((e) => `- ${e}`).join('\n')
+    : ''
+  const withPreamble = (p: string): string => (preamble ? `${preamble}\n\n${p}` : p)
+
+  // Legacy fallback: no stored body → run the (legacy) instructions as one turn.
+  if (!stored) {
+    const task = (contract?.instructions ?? '').trim() || '（本轮没有具体任务说明）'
+    api.phase('执行')
+    const out = await api.agent(
+      withPreamble(
+        [
+          '你是一个按计划自动运行的 Loop agent。下面是这一轮要完成的任务：',
+          task,
+          '请直接完成任务并给出结果（简洁、可直接交付，不要复述任务本身）。',
+        ].join('\n\n'),
+      ),
+      { label: '执行' },
+    )
+    return out
+  }
+
+  // PLAN STEP (乙): ask for THIS run's body, seeded by the stored body.
+  const planText = await api.agent(
+    withPreamble(
+      '这是已固化的执行剧本(JSON ExecutionBody)：' +
+        JSON.stringify(stored) +
+        '\n本轮触发原因：' +
+        (args.reason ?? '') +
+        '\n请返回"这一轮"要执行的剧本，JSON，形如 {"steps":[{"id","kind":"agent|parallel|phase","label","prompt?","children?"}]}。通常原样返回；只有当情况确实需要时才微调(增/删/改步骤)。只输出 JSON，不要任何解释。',
+    ),
+    { label: '计划' },
+  )
+
+  // Detect adaptation: parse the first {...} substring; compare to the stored body.
+  const planned = parseFirstJson(typeof planText === 'string' ? planText : JSON.stringify(planText))
+  let planToRun: ExecutionBody
+  let adapted: boolean
+  if (!planned || JSON.stringify(planned) === JSON.stringify(stored)) {
+    planToRun = stored
+    adapted = false
+  } else {
+    planToRun = planned as ExecutionBody
+    adapted = true
+  }
+
+  await runBody(planToRun, api)
+
+  return { adapted, body: planToRun }
+}
+
+/** Extract + parse the first `{...}` JSON object substring from a model reply. */
+function parseFirstJson(text: string): unknown {
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start === -1 || end === -1 || end < start) return undefined
+  try {
+    return JSON.parse(text.slice(start, end + 1))
+  } catch {
+    return undefined
+  }
+}
+
+export const flows: Record<string, Flow> = { demo: demoFlow, feedback: feedbackFlow, agentLoop: agentLoopFlow, contract: contractFlow }
 
 /** RUN_REAL=1 → real `claude -p`; otherwise the fake keyed to the demo prompt. */
 export function buildExecutor(): Executor {

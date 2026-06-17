@@ -87,7 +87,9 @@ export function loopRunner(deps: LoopRunnerDeps): LoopRunner {
         ...(spec.ownerId !== undefined ? { ownerId: spec.ownerId } : {}),
         // The generic `agentLoop` flow reads its per-round task + name from here
         // (conversational creation); bespoke flows just ignore the extra keys.
-        args: { cursor: state.cursor, instructions: spec.instructions, name: spec.name },
+        // The 乙 `contract` flow reads the whole contract (+ this firing's reason)
+        // so it can run/adapt the contract's stored execution body per tick.
+        args: { cursor: state.cursor, instructions: spec.instructions, name: spec.name, contract: spec, reason: describeTrigger(spec.trigger, cause) },
         budgetUsd: spec.budgetUsd,
         memory,
         awaitApproval: deps.awaitApproval,

@@ -57,6 +57,7 @@ export type EngineEvent =
   | { type: 'budget_exceeded'; runId: string; spent: number; cap: number; ts: number }
   | { type: 'approval_requested'; runId: string; approvalId: string; nodeId: string; prompt: string; options?: string[]; ts: number }
   | { type: 'approval_resolved'; runId: string; approvalId: string; decision: string; note?: string; ts: number }
+  | { type: 'escalation_requested'; runId: string; reason: string; ts: number }
   | { type: 'run_done'; runId: string; status: RunStatus; summary?: string; result?: unknown; ts: number }
 
 /** A per-loop ratcheting memory surface (read full text / append a line). */
