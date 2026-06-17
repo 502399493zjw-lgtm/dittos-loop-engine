@@ -79,8 +79,17 @@ export const feedbackFlow: Flow = async (api) => {
   const { decision } = await api.approval('这批客服回复草稿是否批准发送？', { options: ['批准', '驳回'] })
 
   api.phase('汇总')
+  // Each api.agent() is a stateless turn, so the summary agent only knows what
+  // we hand it — thread the prior results into the prompt explicitly.
   const summary = await api.agent(
-    `用三行中文总结本轮处理：第一行归类概况，第二行草稿要点，第三行审批结论（${decision}）。每行一句话。`,
+    [
+      '下面是本轮用户反馈处理的结果。请用三行中文写一句话简报，不要多余解释：',
+      '第一行：归类概况；第二行：客服草稿要点；第三行：审批结论。',
+      `审批结论：${decision}`,
+      `【归类】\n${String(classified)}`,
+      `【退换草稿】\n${String(reply ?? '')}`,
+      `【Bug 复现】\n${String(bugNote ?? '')}`,
+    ].join('\n\n'),
     { label: '日报' },
   )
   return { classified, reply, bugNote, decision, summary }
