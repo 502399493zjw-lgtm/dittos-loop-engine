@@ -3,7 +3,13 @@ import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import 
 import { createServer } from '../src/server'
 import { fakeExecutor } from '../src/executor/fake'
 import { jsonSessionStore } from '../src/session/jsonSessionStore'
+import { jsonProjectStore } from '../src/project/jsonProjectStore'
+import { fakeGithubOAuth } from '../src/auth/github'
+import { signState } from '../src/auth/state'
+import { jsonUserStore } from '../src/auth/jsonUserStore'
+import { jsonTokenStore } from '../src/auth/jsonTokenStore'
 import type { Message, Session } from '../src/session/types'
+import type { Project } from '../src/project/types'
 
 function sessionServer(withStore = true) {
   const sessionStore = withStore
@@ -13,6 +19,29 @@ function sessionServer(withStore = true) {
     executor: fakeExecutor(), defaultAgent: 'claude', flows: {}, storeDir: undefined, sessionStore,
   })
   return { srv, sessionStore }
+}
+
+// A server with auth + session + project stores wired, so userId is resolved
+// and the "我的" default-project behaviour can be exercised end to end.
+const sessionSecret = 'test-session-secret'
+function authedServer() {
+  const srv = createServer({
+    executor: fakeExecutor(), defaultAgent: 'claude', flows: {}, storeDir: undefined,
+    sessionStore: jsonSessionStore(mkdtempSync(join(tmpdir(), 'srv-sess-'))),
+    projectStore: jsonProjectStore(mkdtempSync(join(tmpdir(), 'srv-proj-'))),
+    auth: {
+      github: fakeGithubOAuth({ user: { id: 99, login: 'u', name: 'U' } }),
+      userStore: jsonUserStore(mkdtempSync(join(tmpdir(), 'srv-user-'))),
+      tokenStore: jsonTokenStore(mkdtempSync(join(tmpdir(), 'srv-token-'))),
+      sessionSecret, appBaseUrl: 'http://localhost:5173',
+    },
+  })
+  return { srv }
+}
+async function mintToken(port: number): Promise<string> {
+  const state = signState(sessionSecret)
+  const cb = await fetch(`http://localhost:${port}/auth/callback?code=x&state=${encodeURIComponent(state)}`, { redirect: 'manual' })
+  return new URL(cb.headers.get('location')!).searchParams.get('token')!
 }
 
 describe('server — session endpoints', () => {
@@ -70,6 +99,33 @@ describe('server — session endpoints', () => {
       { sender: 'agent', text: 'hello' },
     ])
 
+    await srv.close()
+  })
+
+  it('GET /projects ensures a "我的" home project for an authed user', async () => {
+    const { srv } = authedServer()
+    const { port } = await srv.listen(0)
+    const token = await mintToken(port)
+    const projects = (await (await fetch(`http://localhost:${port}/projects`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })).json()) as Project[]
+    expect(projects.some((p) => p.name === '我的')).toBe(true)
+    await srv.close()
+  })
+
+  it('an authed POST /sessions with no projectId defaults into "我的"', async () => {
+    const { srv } = authedServer()
+    const { port } = await srv.listen(0)
+    const token = await mintToken(port)
+    const auth = { Authorization: `Bearer ${token}` }
+
+    const home = ((await (await fetch(`http://localhost:${port}/projects`, { headers: auth })).json()) as Project[])
+      .find((p) => p.name === '我的')!
+    const session = (await (await fetch(`http://localhost:${port}/sessions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...auth }, body: JSON.stringify({ title: 'x' }),
+    })).json()) as Session
+    // No projectId supplied → server resolved it to the user's home project.
+    expect(session.projectId).toBe(home.id)
     await srv.close()
   })
 

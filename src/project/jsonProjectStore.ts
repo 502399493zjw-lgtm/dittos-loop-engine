@@ -23,18 +23,29 @@ export function jsonProjectStore(dir: string, opts?: { now?: () => number; id?: 
   }
   const writeAll = (rows: Project[]) => { writeFileSync(projectsFile, JSON.stringify(rows, null, 2) + '\n') }
 
+  const createProject = (ownerId: string | undefined, name: string): Project => {
+    const project: Project = {
+      id: id(),
+      ...(ownerId !== undefined ? { ownerId } : {}),
+      name,
+      createdAt: now(),
+    }
+    const projects = readAll()
+    projects.push(project)
+    writeAll(projects)
+    return project
+  }
+
   return {
     async create(ownerId, name) {
-      const project: Project = {
-        id: id(),
-        ...(ownerId !== undefined ? { ownerId } : {}),
-        name,
-        createdAt: now(),
-      }
-      const projects = readAll()
-      projects.push(project)
-      writeAll(projects)
-      return project
+      return createProject(ownerId, name)
+    },
+    async getOrCreateDefault(ownerId, name) {
+      // Idempotent "home" project: reuse the owner's project named `name`
+      // ("我的") if it exists, else create it. Sessions with no explicit
+      // project land here so the sidebar always nests them under a project.
+      const existing = readAll().find((p) => p.ownerId === ownerId && p.name === name)
+      return existing ?? createProject(ownerId, name)
     },
     async list(ownerId) {
       const projects = readAll()

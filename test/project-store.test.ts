@@ -68,6 +68,21 @@ describe('jsonProjectStore', () => {
     expect(await s.remove(proj.id)).toBe(false)
   })
 
+  it('getOrCreateDefault creates the home project once, then reuses it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ps-'))
+    const s = jsonProjectStore(dir, { now: clock(), id: ids() })
+    const first = await s.getOrCreateDefault('A', '我的')
+    expect(first.name).toBe('我的')
+    expect(first.ownerId).toBe('A')
+    // Second call returns the SAME project (idempotent), not a duplicate.
+    const second = await s.getOrCreateDefault('A', '我的')
+    expect(second.id).toBe(first.id)
+    expect((await s.list('A')).filter((p) => p.name === '我的')).toHaveLength(1)
+    // Scoped per owner: a different owner gets their own "我的".
+    const other = await s.getOrCreateDefault('B', '我的')
+    expect(other.id).not.toBe(first.id)
+  })
+
   it('persistence survives a fresh jsonProjectStore on the same dir', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ps-'))
     const s1 = jsonProjectStore(dir, { now: clock(), id: ids() })

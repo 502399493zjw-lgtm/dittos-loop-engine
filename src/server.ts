@@ -234,11 +234,17 @@ export function createServer(cfg: ServerConfig) {
       if (!cfg.sessionStore) { res.writeHead(500).end('no session store'); return }
       void readBody(req).then(async (body) => {
         const { projectId, title } = JSON.parse(body || '{}') as { projectId?: string; title?: string }
+        // A conversation with no explicit project defaults into the owner's
+        // "我的" home project, so the sidebar always nests it under a project.
+        let resolvedProjectId = projectId
+        if (resolvedProjectId === undefined && userId !== undefined && cfg.projectStore) {
+          resolvedProjectId = (await cfg.projectStore.getOrCreateDefault(userId, '我的')).id
+        }
         const opts = {
           ...(title !== undefined ? { title } : {}),
           ...(userId !== undefined ? { ownerId: userId } : {}),
         }
-        const session = await cfg.sessionStore!.createSession(projectId, Object.keys(opts).length ? opts : undefined)
+        const session = await cfg.sessionStore!.createSession(resolvedProjectId, Object.keys(opts).length ? opts : undefined)
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(session))
       })
       return
@@ -287,7 +293,13 @@ export function createServer(cfg: ServerConfig) {
 
     if (method === 'GET' && url.split('?')[0] === '/projects') {
       if (!cfg.projectStore) { res.writeHead(500).end('no project store'); return }
-      void cfg.projectStore.list(userId).then((projects) => {
+      // Ensure the authed user always has a "我的" home project so the sidebar
+      // shows it (and new conversations have somewhere to nest) even on a brand
+      // new account. Idempotent — getOrCreateDefault reuses the existing one.
+      const ensure = userId !== undefined
+        ? cfg.projectStore.getOrCreateDefault(userId, '我的').then(() => undefined)
+        : Promise.resolve(undefined)
+      void ensure.then(() => cfg.projectStore!.list(userId)).then((projects) => {
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(projects))
       })
       return

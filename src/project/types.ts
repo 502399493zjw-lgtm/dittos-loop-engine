@@ -15,6 +15,9 @@ export interface Project {
 export interface ProjectStore {
   /** Create a project; ownerId scopes it to one user (undefined = unowned/dev). */
   create(ownerId: string | undefined, name: string): Promise<Project>
+  /** The owner's "home" project named `name` ("我的"), creating it if absent.
+   *  Idempotent — sessions with no explicit project default into this one. */
+  getOrCreateDefault(ownerId: string | undefined, name: string): Promise<Project>
   /** All projects, narrowed to one owner when ownerId is set. */
   list(ownerId?: string): Promise<Project[]>
   /** Rename a project; resolves undefined when no project has that id. */
