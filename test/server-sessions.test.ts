@@ -255,6 +255,82 @@ describe('server — session endpoints', () => {
     await srv.close()
   })
 
+  it('POST /loops/:id/adopt-run overwrites the contract body and is owner-scoped', async () => {
+    // A contract whose body has two steps; we then adopt a new 1-step body and
+    // assert GET /loops surfaces the loop with the new body (decision #4).
+    const contract = {
+      name: 'trending 日报',
+      mode: 'live',
+      goal: '每小时汇总 GitHub trending',
+      trigger: { kind: 'interval', everyMs: 3600000, description: '每小时' },
+      escalation: [],
+      stop: '用户说停止',
+      body: {
+        steps: [
+          { id: 's1', kind: 'agent', label: '抓取', prompt: '抓取 trending' },
+          { id: 's2', kind: 'agent', label: '整理', prompt: '整理成三条' },
+        ],
+      },
+    }
+    const jsonExec = {
+      async run() {
+        return { text: `配置：${JSON.stringify(contract)}`, cost: 0 }
+      },
+    }
+    const sessionStore = jsonSessionStore(mkdtempSync(join(tmpdir(), 'srv-sess-')))
+    const loopStore = jsonLoopStore(mkdtempSync(join(tmpdir(), 'srv-loop-')))
+    const srv = createServer({
+      executor: jsonExec, defaultAgent: 'claude', flows: {}, storeDir: undefined,
+      sessionStore, store: loopStore,
+      projectStore: jsonProjectStore(mkdtempSync(join(tmpdir(), 'srv-proj-'))),
+      auth: {
+        github: fakeGithubOAuth({ user: { id: 13, login: 'u', name: 'U' } }),
+        userStore: jsonUserStore(mkdtempSync(join(tmpdir(), 'srv-user-'))),
+        tokenStore: jsonTokenStore(mkdtempSync(join(tmpdir(), 'srv-token-'))),
+        sessionSecret, appBaseUrl: 'http://localhost:5173',
+      },
+    })
+    const { port } = await srv.listen(0)
+    const token = await mintToken(port)
+    const auth = { Authorization: `Bearer ${token}` }
+
+    // Create a contract loop from a chat session.
+    const session = await sessionStore.createSession(undefined, { title: 'draft' })
+    await sessionStore.appendMessage(session.id, { sender_type: 'user', type: 'text', content: { text: '帮我每小时汇总 trending' } })
+    const created = (await (await fetch(`http://localhost:${port}/loops/from-session`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...auth },
+      body: JSON.stringify({ sessionId: session.id }),
+    })).json()) as { id: string; body: { steps: unknown[] } }
+    expect(created.body.steps).toHaveLength(2)
+
+    // Adopt a new 1-step body.
+    const newBody = { steps: [{ id: 'n1', kind: 'agent', label: '一步搞定', prompt: '一次性汇总并发送' }] }
+    const adopt = await fetch(`http://localhost:${port}/loops/${created.id}/adopt-run`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...auth },
+      body: JSON.stringify({ body: newBody }),
+    })
+    expect(adopt.status).toBe(200)
+    const updated = (await adopt.json()) as { id: string; body: { steps: Array<{ id: string }> } }
+    expect(updated.id).toBe(created.id)
+    expect(updated.body.steps).toHaveLength(1)
+    expect(updated.body.steps[0]!.id).toBe('n1')
+
+    // GET /loops reflects the new body.
+    const loops = (await (await fetch(`http://localhost:${port}/loops`, { headers: auth })).json()) as Array<{ spec: { id: string; body?: { steps: Array<{ id: string }> } } }>
+    const got = loops.find((l) => l.spec.id === created.id)!
+    expect(got.spec.body!.steps).toHaveLength(1)
+    expect(got.spec.body!.steps[0]!.id).toBe('n1')
+
+    // 404 for an unknown id.
+    const missing = await fetch(`http://localhost:${port}/loops/does-not-exist/adopt-run`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...auth },
+      body: JSON.stringify({ body: newBody }),
+    })
+    expect(missing.status).toBe(404)
+
+    await srv.close()
+  })
+
   it('session endpoints 500 when no session store is configured', async () => {
     const { srv } = sessionServer(false)
     const { port } = await srv.listen(0)

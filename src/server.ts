@@ -598,6 +598,29 @@ export function createServer(cfg: ServerConfig) {
       return
     }
 
+    // Decision #4: a tick's *adapted* execution body becomes permanent only on the
+    // user's explicit consent. The frontend posts the adapted body here; we overwrite
+    // spec.body, upsert, and return the updated spec. Owner-scoped: when auth is
+    // configured, a loop not owned by the authed user is 404 (same as unknown).
+    const adoptRun = /^\/loops\/([^/]+)\/adopt-run$/.exec(url)
+    if (method === 'POST' && adoptRun) {
+      const id = adoptRun[1]!
+      if (!cfg.store) { res.writeHead(500).end('no loop store'); return }
+      void readBody(req).then(async (raw) => {
+        const loaded = await cfg.store!.get(id)
+        // Unknown, or owned by someone else when auth scopes the request → 404.
+        if (!loaded || (userId !== undefined && loaded.spec.ownerId !== userId)) {
+          res.writeHead(404).end('unknown loop'); return
+        }
+        const { body } = JSON.parse(raw || '{}') as { body?: ExecutionBody }
+        if (!body || !Array.isArray(body.steps)) { res.writeHead(400).end('invalid execution body'); return }
+        const spec: LoopSpec = { ...loaded.spec, body }
+        await cfg.store!.upsert(spec)
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(spec))
+      })
+      return
+    }
+
     // ---- daemon link: per-user token issue + status (auth-gated, spec §1) ----
     // POST /daemon/tokens → { token }: mint a daemon token for the authed user.
     // The token is shown once; the user runs their local daemon with it so
