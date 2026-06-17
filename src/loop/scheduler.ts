@@ -42,8 +42,11 @@ function minute(x: number | undefined): number {
  * - interval: fires once `everyMs` has elapsed since the last run.
  */
 function isDue(spec: LoopSpec, state: LoopState, t: number): boolean {
+  // One-shot loops are fired explicitly (POST /loops/:id/run-once), never by the
+  // scheduler — even if a stray timer trigger is present, mode wins.
+  if (spec.mode === 'one-shot') return false
   const tr = spec.trigger
-  // No trigger (one-shot) or a non-timer kind (self-paced/event/condition/manual)
+  // No trigger or a non-timer kind (self-paced/event/condition/manual)
   // is never *due* on the interval sweep.
   if (!tr) return false
   switch (tr.kind) {

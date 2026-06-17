@@ -526,6 +526,26 @@ export function createServer(cfg: ServerConfig) {
       return
     }
 
+    // One-shot fire: run the loop's body exactly once now, with no scheduling.
+    // Reuses the same tick path as /trigger (cause kind 'manual'); the runner never
+    // schedules a follow-up, and a one-shot loop carries no trigger so the scheduler
+    // never picks it up either. This is the canonical "Loop (一次性)" run button.
+    const runOnce = /^\/loops\/([^/]+)\/run-once$/.exec(url)
+    if (method === 'POST' && runOnce) {
+      const id = runOnce[1]!
+      if (!cfg.store || !runner) { res.writeHead(500).end('no loop runner'); return }
+      void cfg.store.get(id).then((loaded) => {
+        if (!loaded) { res.writeHead(404).end('unknown loop'); return }
+        // Register the capture BEFORE ticking so the run's first event maps to this request.
+        const runIdReady = new Promise<string>((resolve) => pendingRunIds.push(resolve))
+        void runner.tick(id, { kind: 'manual' }) // fire-and-forget; events stream over WS
+        void runIdReady.then((runId) => {
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ runId }))
+        })
+      })
+      return
+    }
+
     const resume = /^\/loops\/([^/]+)\/resume$/.exec(url)
     if (method === 'POST' && resume) {
       const id = resume[1]!

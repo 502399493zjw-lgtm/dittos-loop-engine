@@ -132,6 +132,42 @@ describe('loopScheduler — interval ticking', () => {
     expect(calls.filter((id) => id === 'CRON')).toHaveLength(1)
   })
 
+  it('never schedules a one-shot loop (no trigger)', async () => {
+    const store = freshStore()
+    // one-shot Loop: mode set, no trigger at all
+    await store.upsert(spec({ id: 'ONESHOT', mode: 'one-shot', trigger: undefined }))
+    const runner = fakeRunner()
+    let clock = 0
+    const sched = loopScheduler({ store, runner, tickMs: 100, now: () => clock })
+
+    sched.start()
+    for (let t = 100; t <= 2000; t += 100) {
+      clock = t
+      await vi.advanceTimersByTimeAsync(100)
+    }
+    sched.stop()
+
+    expect(runner.calls).toHaveLength(0)
+  })
+
+  it('never schedules a one-shot loop even if it carries a timer trigger', async () => {
+    const store = freshStore()
+    // mode wins: a one-shot loop must not auto-fire even with an interval trigger present
+    await store.upsert(spec({ id: 'ONESHOT2', mode: 'one-shot', trigger: { kind: 'interval', everyMs: 1000 } }))
+    const runner = fakeRunner()
+    let clock = 0
+    const sched = loopScheduler({ store, runner, tickMs: 100, now: () => clock })
+
+    sched.start()
+    for (let t = 100; t <= 2000; t += 100) {
+      clock = t
+      await vi.advanceTimersByTimeAsync(100)
+    }
+    sched.stop()
+
+    expect(runner.calls).toHaveLength(0)
+  })
+
   it('does not fire a cron loop in a non-matching minute', async () => {
     const store = freshStore()
     await store.upsert(spec({ id: 'CRON', trigger: { kind: 'cron', expr: '0 9 * * *' } }))

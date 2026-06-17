@@ -131,6 +131,45 @@ describe('server — loop endpoints', () => {
     await srv.close()
   })
 
+  it('POST /loops/:id/run-once fires exactly one run and streams it over WS', async () => {
+    const flow: Flow = async (api) => { api.phase('p'); await api.agent('hi'); return 'ok' }
+    const { srv, store } = loopServer({ demo: flow })
+    const { port } = await srv.listen(0)
+    // a one-shot loop: mode set, no trigger (so the scheduler never touches it)
+    await fetch(`http://localhost:${port}/loops`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(loopSpec({ mode: 'one-shot', trigger: undefined })),
+    })
+
+    const res = await fetch(`http://localhost:${port}/loops/L1/run-once`, { method: 'POST' })
+    expect(res.status).toBe(200)
+    const { runId } = (await res.json()) as { runId: string }
+    expect(typeof runId).toBe('string')
+
+    const types: string[] = await new Promise((resolve) => {
+      const ws = new WebSocket(`ws://localhost:${port}/runs/${runId}/events`)
+      const seen: string[] = []
+      ws.on('message', (d) => { const e = JSON.parse(d.toString()); seen.push(e.type); if (e.type === 'run_done') { ws.close(); resolve(seen) } })
+    })
+    expect(types).toContain('agent_started')
+    expect(types).toContain('run_done')
+
+    // exactly one run happened: lastRunAt recorded, and the loop has no scheduled next run
+    const stored = await store.get('L1')
+    expect(stored?.state.lastRunAt).toBeTypeOf('number')
+    expect(stored?.spec.trigger).toBeUndefined()
+
+    await srv.close()
+  })
+
+  it('POST /loops/:id/run-once on an unknown loop 404s', async () => {
+    const { srv } = loopServer({ demo: async () => 'ok' })
+    const { port } = await srv.listen(0)
+    const res = await fetch(`http://localhost:${port}/loops/nope/run-once`, { method: 'POST' })
+    expect(res.status).toBe(404)
+    await srv.close()
+  })
+
   it('POST /loops/:id/resume clears paused + resets failures', async () => {
     const flow: Flow = async () => 'ok'
     const { srv, store } = loopServer({ demo: flow })
